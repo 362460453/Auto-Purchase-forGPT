@@ -1,0 +1,8 @@
+{
+  "name": "auto-purchase-for-gpt",
+  "version": "0.2.0",
+  "private": true,
+  "description": "本地 AdsPower 并发 GPT 升级控制台",
+  "type": "module",
+  "scripts": {"start": "node server.mjs", "dev": "node dev.mjs", "check": "find . -path './node_modules' -prune -o \\( -name '*.mjs' -o -name '*.js' \\) -print0 | xargs -0 -n1 node --check"}
+}

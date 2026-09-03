@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GPT 升级控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <strong>GPT / UPGRADE</strong>
+      <div class="header-actions"><span>LOCAL ONLY</span><button id="settings-open" class="settings-button" type="button">设置</button></div>
+    </header>
+    <section class="hero">
+      <p class="eyebrow">ADSPOWER AUTOMATION · 0.2</p>
+      <h1>批量升级 GPT</h1>
+      <p>导入 AdsPower 账号任务，选择产品和倍率后启动浏览器流程。</p>
+    </section>
+    <section class="panel">
+      <div class="toolbar">
+        <div><label class="label">任务文件</label><input id="csv-file" type="file" accept=".csv,text/csv"></div>
+        <a id="download-template" href="#">下载 CSV 模板</a>
+        <div class="concurrency"><label class="label" for="concurrency">并发数</label><input id="concurrency" type="number" min="1" max="10" value="1"></div>
+      </div>
+      <div id="file-name" class="file-name">尚未选择文件</div>
+      <div class="choices">
+        <label>个人版套餐<select id="product" disabled><option selected>Maximum power</option></select></label>
+        <fieldset><legend>倍率</legend><label><input type="radio" name="multiplier" value="20x" checked> 20 倍</label><label><input type="radio" name="multiplier" value="5x"> 5 倍</label></fieldset>
+        <label>Billing 地址州<select id="billing-state"><option value="OR" selected>Oregon / 俄勒冈州</option></select></label>
+      </div>
+      <div id="discovered-plans" class="discovered-plans" hidden></div>
+      <div id="validation" class="validation" hidden></div>
+      <div id="task-list" class="task-list" hidden><div class="list-head"><h2>已导入任务</h2><span id="task-count"></span></div><div id="task-table-wrap" class="table-wrap"><table><thead><tr><th>AdsPower 编号</th><th>邮箱</th><th>密码</th><th>银行卡</th><th>有效期</th><th>CVV</th><th>Billing 地址</th><th>状态</th><th>失败原因</th></tr></thead><tbody id="task-body"></tbody></table></div></div>
+      <div class="main-actions"><button id="start" disabled>启动 GPT 升级流程 <span>↗</span></button><button id="retry-failed" class="secondary-action" disabled>重试</button></div>
+      <section class="activity"><h2>执行状态</h2><div id="activity">等待导入文件</div><ul id="events"></ul></section>
+    </section>
+    <footer>银行卡来自本地 CSV · Billing 地址按所选州生成 · 填写地址后点击 Subscribe · 拒付只结束当前任务</footer>
+  </main>
+  <div id="reason-zoom" class="reason-zoom" hidden></div>
+  <dialog id="settings-dialog"><form method="dialog" id="settings-form"><div class="dialog-head"><h2>本地设置</h2><button type="submit" class="dialog-close" aria-label="关闭">×</button></div><label>AdsPower 地址<input id="adspower-api-base" type="url" placeholder="http://127.0.0.1:50325" required></label><label>API-Key<input id="adspower-api-key" type="password" autocomplete="off" placeholder="请输入 API-Key" required></label><p class="dialog-note">AdsPower 配置保存在当前浏览器本地。CSV 保持六列；导入时按所选州为每条任务生成 Billing 地址。地址内容不会写入执行日志。</p><div class="dialog-actions"><button id="settings-cancel" type="button" class="secondary">取消</button><button type="submit">保存设置</button></div></form></dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
