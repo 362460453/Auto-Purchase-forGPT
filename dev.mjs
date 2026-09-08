@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readdir, stat } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { extname, join, sep } from 'node:path';
+import { clearTemporaryScreenshots } from './src/temp-screenshots.mjs';
 
 const PROJECT_DIRECTORY = new URL('.', import.meta.url);
 const WATCHED_EXTENSIONS = new Set(['.mjs', '.js', '.html', '.css']);
@@ -15,7 +16,7 @@ async function sourceSnapshot() {
   const files = entries
     .filter((entry) => entry.isFile() && WATCHED_EXTENSIONS.has(extname(entry.name)))
     .map((entry) => join(entry.parentPath, entry.name))
-    .filter((path) => !path.includes('/node_modules/') && !path.includes('/.git/'));
+    .filter((path) => !path.includes(`${sep}node_modules${sep}`) && !path.includes(`${sep}.git${sep}`));
   const snapshot = new Map();
   await Promise.all(files.map(async (path) => {
     const fileStat = await stat(path);
@@ -68,7 +69,14 @@ async function pollChanges() {
 }
 
 async function shutdown() {
-  if (serverProcess && serverProcess.exitCode === null) serverProcess.kill('SIGTERM');
+  if (serverProcess && serverProcess.exitCode === null) {
+    await new Promise((resolve) => {
+      serverProcess.once('exit', resolve);
+      serverProcess.kill('SIGTERM');
+    });
+  }
+  // 用户关掉本地服务时才清临时截图；热更新 SIGTERM 重启不会走到这里。
+  await clearTemporaryScreenshots().catch(() => {});
   process.exit(0);
 }
 

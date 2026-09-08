@@ -1,4 +1,7 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { startAdsPowerProfile, stopAdsPowerProfile } from './adspower.mjs';
+import { screenshotDirectory } from '../temp-screenshots.mjs';
 
 export const PRODUCTS = ['Maximum power'];
 
@@ -6,6 +9,13 @@ const MULTIPLIERS = ['20x', '5x'];
 const DOM_POLL_MILLISECONDS = 250;
 const CHECKOUT_WAIT_MILLISECONDS = 45000;
 const STRIPE_WAIT_MILLISECONDS = 30000;
+const SUBSCRIBE_RESULT_WAIT_MILLISECONDS = 90000;
+const ROW_TIMEOUT_MILLISECONDS = 180000;
+const ROW_TIMEOUT_MESSAGE = '超过 3 分钟最大处理时间，已终止当前任务';
+// Stripe 2026-09 把 Payment/Address iframe 从 elements-inner-payment / elements-inner-address
+// 改成了同一份 elements-inner-accessory-target，只靠 componentName 区分；旧文件名仍要兼容。
+const STRIPE_PAYMENT_TARGET_PATTERN = /elements-inner-[\w.-]*.*componentName=payment(?:&|$)/i;
+const STRIPE_ADDRESS_TARGET_PATTERN = /elements-inner-[\w.-]*.*componentName=address(?:&|$)/i;
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 let commandSequence = 0;
@@ -56,20 +66,32 @@ async function getTargets(debugPort) {
   return response.json();
 }
 
-async function connectChatGptPage(debugPort) {
+function isChatGptHomeUrl(url) {
+  const href = String(url || '');
+  return /chatgpt\.com/i.test(href) && !/\/checkout\//i.test(href) && !/#pricing/i.test(href);
+}
+
+function isChatGptHomeTarget(item) {
+  return item?.type === 'page' && isChatGptHomeUrl(item.url) && item.webSocketDebuggerUrl;
+}
+
+async function connectChatGptPage(debugPort, options = {}) {
   const targets = await getTargets(debugPort);
-  const target = targets.find((item) => item.type === 'page' && /chatgpt\.com/i.test(item.url || ''))
+  const chatPages = targets.filter((item) => item.type === 'page' && /chatgpt\.com/i.test(item.url || ''));
+  const homePage = chatPages.find((item) => isChatGptHomeUrl(item.url));
+  const target = (options.preferHome && homePage)
+    || chatPages[0]
     || targets.find((item) => item.type === 'page' && item.webSocketDebuggerUrl);
   if (!target?.webSocketDebuggerUrl) throw new Error('AdsPower 没有可控制的页面');
   return connectCdp(target.webSocketDebuggerUrl);
 }
 
-async function evaluate(client, expression, awaitPromise = false) {
+async function evaluate(client, expression, awaitPromise = false, commandTimeoutMilliseconds) {
   const result = await client.command('Runtime.evaluate', {
     expression,
     awaitPromise,
     returnByValue: true,
-  });
+  }, commandTimeoutMilliseconds);
   if (result.exceptionDetails) throw new Error('页面脚本执行失败');
   return result.result?.value;
 }
@@ -92,19 +114,23 @@ async function mouseClick(client, point) {
 }
 
 async function clickExactText(client, text, options = {}) {
-  const expectedText = JSON.stringify(text);
+  const labels = [text, ...(options.alternateTexts || [])].filter(Boolean);
+  const expectedTexts = JSON.stringify(labels);
   const region = options.region || 'any';
   const readPoint = () => evaluate(client, `(() => {
       const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const labels = ${expectedTexts};
       const visible = (node) => {
         const rect = node.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
       };
-      const candidates = [...document.querySelectorAll('button,a,[role="button"],[role="radio"],[role="tab"],label')]
-        .filter((node) => !node.disabled && visible(node) && normalize(node.innerText || node.textContent || node.getAttribute('aria-label')) === ${expectedText})
+      const candidates = [...document.querySelectorAll('button,a,[role="button"],[role="link"],[role="menuitem"],[role="radio"],[role="tab"],label')]
         .map((node) => {
+          const label = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
+          if (node.disabled || !visible(node) || !labels.includes(label)) return null;
           const rect = node.getBoundingClientRect();
           return {
+            label,
             x: rect.left + rect.width / 2,
             y: rect.top + rect.height / 2,
             left: rect.left,
@@ -112,13 +138,18 @@ async function clickExactText(client, text, options = {}) {
             right: rect.right,
             bottom: rect.bottom,
           };
-        });
+        })
+        .filter(Boolean);
       const filtered = ${JSON.stringify(region)} === 'top-right'
         ? candidates.filter((item) => item.left > innerWidth * 0.55 && item.top < Math.min(220, innerHeight * 0.35))
+        : ${JSON.stringify(region)} === 'left'
+        ? candidates.filter((item) => item.left < innerWidth * 0.45)
         : candidates;
-      filtered.sort((left, right) => ${JSON.stringify(region)} === 'top-right'
-        ? right.left - left.left
-        : left.top - right.top);
+      filtered.sort((left, right) => {
+        if (${JSON.stringify(region)} === 'top-right') return right.left - left.left;
+        if (right.label.length !== left.label.length) return right.label.length - left.label.length;
+        return left.top - right.top;
+      });
       return {
         readyState: document.readyState,
         point: filtered[0] || null,
@@ -135,9 +166,9 @@ async function clickExactText(client, text, options = {}) {
         && point.x >= 0 && point.x <= viewport.width
         && point.y >= 0 && point.y <= viewport.height;
       if (state?.readyState === 'complete' && insideViewport) break;
-      if (point && viewport) {
-        // 使用真实鼠标滚轮把屏幕外的链接滚入可视区域，不能直接点击屏幕外坐标。
-        const deltaY = point.y > viewport.height ? 620 : -620;
+      if (viewport) {
+        // 促销价页的 See all plans 可能还没进可视区；没找到目标时也要向下滚，不能停在当前两张卡片上。
+        const deltaY = !point || point.y > (viewport.height || 0) ? 620 : -620;
         await client.command('Input.dispatchMouseEvent', {
           type: 'mouseWheel',
           x: Math.max(1, viewport.width / 2),
@@ -202,8 +233,37 @@ async function waitForPageText(client, text, timeoutMilliseconds, timeoutMessage
 
 async function readPricingModalState(client) {
   return evaluate(client, `(() => {
+    const href = location.href || '';
     const bodyText = document.body?.innerText || '';
-    return /#pricing$/.test(location.href) && bodyText.includes('Upgrade your plan');
+    if (!href.includes('#pricing')) return false;
+    // 标准弹窗标题是 Upgrade your plan；右上角 Free offer 会打开 plus-1-month-free 促销价页，没有该标题，但仍必须继续点 See all plans。
+    return bodyText.includes('Upgrade your plan')
+      || bodyText.includes('Claim free offer')
+      || bodyText.includes('See all plans')
+      || /\\bSee all\\b/.test(bodyText);
+  })()`);
+}
+
+async function readHomeUpgradeEntry(client) {
+  return evaluate(client, `(() => {
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visible = (node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
+    };
+    const inTopRight = (rect) => rect.left > innerWidth * 0.55 && rect.top < Math.min(220, innerHeight * 0.35);
+    const buttons = [...document.querySelectorAll('button,a,[role="button"]')]
+      .filter((node) => !node.disabled && visible(node));
+    const findText = (text, region) => buttons.find((node) => {
+      const label = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
+      if (label !== text) return false;
+      const rect = node.getBoundingClientRect();
+      return region !== 'top-right' || inTopRight(rect);
+    });
+    if (findText('Upgrade', 'top-right')) return {text:'Upgrade', region:'top-right'};
+    if (findText('Free offer', 'top-right')) return {text:'Free offer', region:'top-right'};
+    if (findText('Claim offer')) return {text:'Claim offer', region:'any'};
+    return null;
   })()`);
 }
 
@@ -506,34 +566,58 @@ function isStripeCardFormReady(state) {
   return Boolean(state?.numberReady && state?.expiryReady && state?.cvcReady);
 }
 
+function summarizeStripeIframeTargets(targets) {
+  const seen = [];
+  for (const item of targets) {
+    if (item.type !== 'iframe' || !/stripe/i.test(item.url || '')) continue;
+    const url = String(item.url || '');
+    const file = (url.split('#')[0].split('?')[0].split('/').pop() || '')
+      .replace(/-[a-f0-9]{8,}.*$/i, '');
+    const component = decodeURIComponent(url.match(/componentName=([^&]+)/i)?.[1] || '');
+    const elementKind = decodeURIComponent(url.match(/elementId=([^&-]+)/i)?.[1] || '');
+    const summary = [file, component && `componentName=${component}`, elementKind && `elementId=${elementKind}`]
+      .filter(Boolean)
+      .join(' ');
+    if (summary && !seen.includes(summary)) seen.push(summary);
+    if (seen.length >= 12) break;
+  }
+  return seen;
+}
+
 async function waitForStripeTarget(debugPort, targetPattern, readySelector, label) {
-  return waitForValue(async () => {
-    const targets = await getTargets(debugPort);
-    const candidates = targets.filter((item) => item.type === 'iframe' && targetPattern.test(item.url || '') && item.webSocketDebuggerUrl);
-    for (const target of candidates) {
-      const frame = await connectCdp(target.webSocketDebuggerUrl, 5000);
-      try {
-        await frame.command('Runtime.enable');
-        const waitForCardForm = readySelector === '#payment-numberInput';
-        const state = waitForCardForm
-          ? await readStripeCardFormState(frame)
-          : await evaluate(frame, `(() => {
-              const element = document.querySelector(${JSON.stringify(readySelector)});
-              if (!element) return {ready:false};
-              const rect = element.getBoundingClientRect();
-              return {ready: rect.width > 0 && rect.height > 0 && !element.disabled};
-            })()`);
-        const ready = waitForCardForm ? isStripeCardFormReady(state) : Boolean(state?.ready);
-        if (ready) return { frame, targetUrl: target.url };
-        // Stripe 偶尔保留 PayPal 等其它方式；必须先点 Card，并等到卡号/有效期/CVV 都刷新出来，才能开始打字。
-        if (waitForCardForm && state?.cardPoint && !state.cardSelected) await mouseClick(frame, state.cardPoint);
-      } catch {
+  try {
+    return await waitForValue(async () => {
+      const targets = await getTargets(debugPort);
+      const candidates = targets.filter((item) => item.type === 'iframe' && targetPattern.test(item.url || '') && item.webSocketDebuggerUrl);
+      for (const target of candidates) {
+        const frame = await connectCdp(target.webSocketDebuggerUrl, 5000);
+        try {
+          await frame.command('Runtime.enable');
+          const waitForCardForm = readySelector === '#payment-numberInput';
+          const state = waitForCardForm
+            ? await readStripeCardFormState(frame)
+            : await evaluate(frame, `(() => {
+                const element = document.querySelector(${JSON.stringify(readySelector)});
+                if (!element) return {ready:false};
+                const rect = element.getBoundingClientRect();
+                return {ready: rect.width > 0 && rect.height > 0 && !element.disabled};
+              })()`);
+          const ready = waitForCardForm ? isStripeCardFormReady(state) : Boolean(state?.ready);
+          if (ready) return { frame, targetUrl: target.url };
+          // Stripe 偶尔保留 PayPal 等其它方式；必须先点 Card，并等到卡号/有效期/CVV 都刷新出来，才能开始打字。
+          if (waitForCardForm && state?.cardPoint && !state.cardSelected) await mouseClick(frame, state.cardPoint);
+        } catch {
+          frame.close();
+        }
         frame.close();
       }
-      frame.close();
-    }
-    return null;
-  }, Boolean, STRIPE_WAIT_MILLISECONDS, `等待 ${label} 超时`);
+      return null;
+    }, Boolean, STRIPE_WAIT_MILLISECONDS, `等待 ${label} 超时`);
+  } catch (error) {
+    // 超时只记录 iframe 文件名和 componentName，避免把 Stripe URL 里的邮箱或公钥写进日志。
+    const observed = summarizeStripeIframeTargets(await getTargets(debugPort).catch(() => []));
+    throw new Error(`${error.message}；当前 Stripe iframe：${observed.join(' | ') || '无'}`);
+  }
 }
 
 async function waitForStripeCardPaymentReady(payment, onStep = () => {}) {
@@ -741,7 +825,7 @@ function stateName(state) {
 async function fillStripeCard(debugPort, row, onStep = () => {}) {
   const target = await waitForStripeTarget(
     debugPort,
-    /elements-inner-payment.*componentName=payment/i,
+    STRIPE_PAYMENT_TARGET_PATTERN,
     '#payment-numberInput',
     'Stripe Card 输入框',
   );
@@ -772,26 +856,81 @@ async function fillStripeCard(debugPort, row, onStep = () => {}) {
   }
 }
 
-async function ensureStripeCountryUnitedStates(address) {
-  const countrySelector = '#billingAddress-countryInput, select[name="country"]';
-  const country = await evaluate(address, `(() => {
-    const element = document.querySelector(${JSON.stringify(countrySelector)});
-    return element ? {
-      value: String(element.value || '').trim(),
-      text: String(element.selectedOptions?.[0]?.textContent || '').trim(),
-    } : null;
+async function readStripeFieldFilled(client, selector) {
+  return evaluate(client, `(() => {
+    const element = document.querySelector(${JSON.stringify(selector)});
+    if (!element) return {found:false, filled:false};
+    const value = String(element.value || '').trim();
+    const text = String(element.selectedOptions?.[0]?.textContent || '').trim();
+    const placeholder = /^(select|choose|state|province)?$/i.test(value)
+      || /^(select|choose|state|province)?$/i.test(text);
+    return {found:true, filled: Boolean(value || text) && !placeholder};
   })()`);
-  const currentValues = [country?.value, country?.text].map((value) => String(value || '').toLowerCase());
-  if (currentValues.includes('us') || currentValues.includes('united states')) return;
+}
 
-  // 只有页面当前不是美国时才操作国家下拉框，避免重复选择导致地址字段被清空或重绘。
-  await chooseSelectWithKeyboard(
-    address,
-    countrySelector,
-    'United States',
-    ['US', 'United States'],
-    'Country or region',
-  );
+async function fillStripeAddressFieldIfEmpty(client, selector, value, options = {}) {
+  const state = await readStripeFieldFilled(client, selector);
+  // 地址被 Stripe 自动填充或上次留下内容时，禁止清空重填，避免把 City / ZIP 等连带冲掉。
+  if (state?.filled) {
+    options.onSkip?.(`${options.label || '地址字段'} 已有内容，跳过输入`);
+    return 'skipped';
+  }
+  await focusAndType(client, selector, value, options);
+  return 'typed';
+}
+
+async function chooseStripeSelectIfEmpty(client, selector, searchText, acceptedValues, label, onSkip = () => {}) {
+  const state = await readStripeFieldFilled(client, selector);
+  if (state?.filled) {
+    onSkip(`${label} 已有内容，跳过选择`);
+    return 'skipped';
+  }
+  await chooseSelectWithKeyboard(client, selector, searchText, acceptedValues, label);
+  return 'typed';
+}
+
+async function readStripeCountryState(address) {
+  return evaluate(address, `(() => {
+    const element = document.querySelector('#billingAddress-countryInput, select[name="country"], input[name="country"]');
+    if (!element) return {found:false, isUnitedStates:false, isSelect:false};
+    const value = String(element.value || '').trim();
+    const text = String(element.selectedOptions?.[0]?.textContent || '').trim();
+    const shown = String(element.innerText || element.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+    const tokens = [value, text, shown].map((item) => item.toLowerCase());
+    const isUnitedStates = tokens.some((item) => item === 'us' || item === 'usa' || item.includes('united states'));
+    return {found:true, isUnitedStates, isSelect: element.tagName === 'SELECT'};
+  })()`);
+}
+
+async function ensureStripeCountryUnitedStates(address, onStep = () => {}) {
+  const countrySelector = '#billingAddress-countryInput, select[name="country"], input[name="country"]';
+  const current = await readStripeCountryState(address);
+  if (!current?.found) throw new Error('没有找到账单国家输入框');
+  // 国家字段特殊：必须是美国。已是美国才跳过；其他国家即使有值也要替换成 United States。
+  if (current.isUnitedStates) {
+    onStep('账单国家已是 United States，跳过');
+    return;
+  }
+
+  onStep('账单国家不是美国，切换为 United States');
+  if (current.isSelect) {
+    await chooseSelectWithKeyboard(
+      address,
+      countrySelector,
+      'United States',
+      ['US', 'USA', 'United States'],
+      'Country or region',
+    );
+  } else {
+    await focusAndType(address, countrySelector, 'United States', {
+      intervalMilliseconds: 80,
+      label: 'Country or region',
+    });
+  }
+  // 切换国家会重绘地址表单；等美国格式稳定后再填后续字段，超时风险由 City/State/ZIP 等待承担。
+  await sleep(600);
+  const after = await readStripeCountryState(address);
+  if (!after?.isUnitedStates) throw new Error('账单国家未能切换为 United States');
 }
 
 async function waitForStripeAddressDetailFields(address) {
@@ -811,47 +950,68 @@ async function waitForStripeAddressDetailFields(address) {
     })()`),
     (state) => state?.city && state?.state && state?.postalCode,
     5000,
-    'Address line 1 已输入，但等待 5 秒仍未显示 City、State、ZIP code',
+    '等待 5 秒仍未显示 City、State、ZIP code',
   );
 }
 
 async function fillStripeBillingAddress(debugPort, row, onStep = () => {}) {
   const target = await waitForStripeTarget(
     debugPort,
-    /elements-inner-address.*componentName=address/i,
+    STRIPE_ADDRESS_TARGET_PATTERN,
     '#billingAddress-nameInput, input[name="name"]',
     'Stripe Billing address 输入框',
   );
   const address = target.frame;
   try {
     const keyboardOptions = { intervalMilliseconds: 100 };
-    onStep('检查账单国家；不是 United States 时切换为 United States');
-    await ensureStripeCountryUnitedStates(address);
+    onStep('先判断账单国家是否为美国');
+    await ensureStripeCountryUnitedStates(address, onStep);
 
-    onStep('逐字符输入账单姓名和 Address line 1');
-    await focusAndType(address, '#billingAddress-nameInput, input[name="name"]', row.billingName, { ...keyboardOptions, label: 'Full name' });
-    await focusAndType(address, '#billingAddress-addressLine1Input, input[name="addressLine1"]', row.billingAddressLine1, { ...keyboardOptions, label: 'Address line 1' });
+    onStep('填写账单姓名和 Address line 1；已有内容则跳过');
+    await fillStripeAddressFieldIfEmpty(address, '#billingAddress-nameInput, input[name="name"]', row.billingName, {
+      ...keyboardOptions,
+      label: 'Full name',
+      onSkip: onStep,
+    });
+    await fillStripeAddressFieldIfEmpty(address, '#billingAddress-addressLine1Input, input[name="addressLine1"]', row.billingAddressLine1, {
+      ...keyboardOptions,
+      label: 'Address line 1',
+      onSkip: onStep,
+    });
 
-    onStep('Address line 1 已输入，等待 City、State、ZIP code 动态出现');
+    onStep('等待 City、State、ZIP code 出现');
     await waitForStripeAddressDetailFields(address);
     if (String(row.billingAddressLine2 || '').trim()) {
-      await focusAndType(address, '#billingAddress-addressLine2Input, input[name="addressLine2"]', row.billingAddressLine2, { ...keyboardOptions, label: 'Address line 2' });
+      await fillStripeAddressFieldIfEmpty(address, '#billingAddress-addressLine2Input, input[name="addressLine2"]', row.billingAddressLine2, {
+        ...keyboardOptions,
+        label: 'Address line 2',
+        onSkip: onStep,
+      });
     }
 
-    onStep('逐字符输入 City');
-    await focusAndType(address, '#billingAddress-localityInput, input[name="locality"]', row.billingCity, { ...keyboardOptions, label: 'City' });
+    onStep('填写 City；已有内容则跳过');
+    await fillStripeAddressFieldIfEmpty(address, '#billingAddress-localityInput, input[name="locality"]', row.billingCity, {
+      ...keyboardOptions,
+      label: 'City',
+      onSkip: onStep,
+    });
     const fullStateName = stateName(row.billingState);
-    onStep('用键盘选择 State');
-    await chooseSelectWithKeyboard(
+    onStep('选择 State；已有内容则跳过');
+    await chooseStripeSelectIfEmpty(
       address,
       '#billingAddress-administrativeAreaInput, select[name="administrativeArea"]',
       fullStateName,
       [row.billingState, fullStateName],
       'State',
+      onStep,
     );
-    onStep('逐字符输入 ZIP code');
-    await focusAndType(address, '#billingAddress-postalCodeInput, input[name="postalCode"]', row.billingPostalCode, { ...keyboardOptions, label: 'ZIP code' });
-    onStep('ZIP code 已输入，账单地址填写完成');
+    onStep('填写 ZIP code；已有内容则跳过');
+    await fillStripeAddressFieldIfEmpty(address, '#billingAddress-postalCodeInput, input[name="postalCode"]', row.billingPostalCode, {
+      ...keyboardOptions,
+      label: 'ZIP code',
+      onSkip: onStep,
+    });
+    onStep('账单地址已就绪');
   } finally {
     address.close();
   }
@@ -864,12 +1024,17 @@ async function readSubscribeButtonState(page) {
       const rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
     };
-    const button = [...document.querySelectorAll('button,a,[role="button"]')]
-      .find((node) => visible(node) && normalize(node.innerText || node.textContent || node.getAttribute('aria-label')) === 'Subscribe');
-    if (!button) return {found:false, enabled:false};
+    // 结账主 CTA 文案会随产品变化，只认含 Subscribe 的按钮，不按产品名精确匹配。
+    const isSubscribeCta = (label) => /\\bSubscribe\\b/i.test(label)
+      && !/\\bUnsubscribe\\b/i.test(label)
+      && label.length <= 48;
+    const button = [...document.querySelectorAll('button,[role="button"]')]
+      .find((node) => visible(node) && isSubscribeCta(normalize(node.innerText || node.textContent || node.getAttribute('aria-label'))));
+    if (!button) return {found:false, enabled:false, label:''};
     return {
       found: true,
       enabled: !button.disabled && button.getAttribute('aria-disabled') !== 'true',
+      label: normalize(button.innerText || button.textContent || button.getAttribute('aria-label')),
     };
   })()`);
 }
@@ -892,39 +1057,105 @@ async function readSubscribeOutcome(page) {
       || (body.includes('Your payment was declined') ? (declinedFromBody || 'Your payment was declined. Try a different card.') : '');
     const leftCheckout = !/\\/checkout\\//i.test(location.href);
     const successText = /you('re| are) all set|welcome to chatgpt pro|subscription (is )?now active|thanks for subscribing/i.test(body);
+    const processing = [...document.querySelectorAll('button,[role="button"]')].some((node) => {
+      if (!visible(node)) return false;
+      const label = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
+      const subscribeLike = /\\bSubscribe\\b/i.test(label) || node.getAttribute('aria-busy') === 'true';
+      if (!subscribeLike) return false;
+      return node.disabled
+        || node.getAttribute('aria-disabled') === 'true'
+        || node.getAttribute('aria-busy') === 'true';
+    });
     return {
       href: location.href,
       error,
       success: !error && (leftCheckout || successText),
+      processing,
     };
   })()`);
 }
 
-async function clickSubscribeAndAwaitResult(page, onStep = () => {}) {
-  onStep('账单地址已填写，等待 Subscribe 可点击');
-  await waitForValue(
+async function readSubscribeProgress(page, debugPort) {
+  const targets = await getTargets(debugPort).catch(() => []);
+  const chatPages = targets.filter((item) => item?.type === 'page' && /chatgpt\.com/i.test(item.url || ''));
+  const checkoutOpen = chatPages.some((item) => /\/checkout\//i.test(item.url || ''));
+  const homeOpened = chatPages.some((item) => isChatGptHomeUrl(item.url));
+  // 支付成功后同一标签会变成首页；先看 CDP 标签 URL，避免卡在正在卸载的 checkout 文档上做 evaluate。
+  if (homeOpened && !checkoutOpen) {
+    return { href: '', error: '', success: true, processing: false };
+  }
+  const fromPage = await readSubscribeOutcome(page).catch(() => null);
+  return {
+    href: fromPage?.href || '',
+    error: fromPage?.error || '',
+    success: Boolean(fromPage?.success || (homeOpened && !checkoutOpen)),
+    processing: Boolean(fromPage?.processing),
+  };
+}
+
+function describeSubscribeProgress(state, prefix) {
+  if (state?.error) return `${prefix}出现支付结果`;
+  if (state?.success) return `${prefix}已离开结账页`;
+  return `${prefix}页面已开始处理支付`;
+}
+
+async function clickSubscribeAndAwaitResult(page, debugPort, onStep = () => {}) {
+  onStep('账单地址已填写，等待 Subscribe 订阅按钮可点击');
+  const button = await waitForValue(
     () => readSubscribeButtonState(page),
     (state) => state?.found && state?.enabled,
     15000,
-    // 等待 Stripe 完成地址校验并点亮 Subscribe；超时后点击会无效，当前任务失败，其他并发任务继续。
-    'ZIP 已输入，但 Subscribe 仍不可点击',
+    // 只认含 Subscribe 的结账主按钮，不要求产品名一字不差。超时后点击会无效，当前任务失败，其他并发任务继续。
+    '资料已填完，但含 Subscribe 的订阅按钮仍不可点击',
   );
-  onStep('点击 Subscribe');
-  // Subscribe 会产生真实扣款，只点一次，不能因为结果还没返回就补点第二次。
-  await clickExactText(page, 'Subscribe', {
+  const clickOptions = {
+    alternateTexts: ['Subscribe'],
     timeoutMilliseconds: 10000,
     timeoutMessage: '没有找到可点击的 Subscribe',
     stabilityMilliseconds: 600,
-  });
-  onStep('已点击 Subscribe，等待支付成功或拒付结果');
+  };
+  const progressed = async () => {
+    const state = await readSubscribeProgress(page, debugPort);
+    return (state.error || state.success || state.processing) ? state : false;
+  };
+
+  onStep(`第一次点击 ${button.label || 'Subscribe'}`);
+  await clickExactText(page, button.label || 'Subscribe', clickOptions);
+  let state;
+  let usedRetry = false;
+  try {
+    state = await waitForValue(progressed, Boolean, 10000, '第一次点击后页面未开始处理支付');
+    onStep(describeSubscribeProgress(state, '第一次点击后'));
+  } catch {
+    // 第一次点击被吞掉时只补点当前按钮一次，不重跑整条任务。
+    usedRetry = true;
+    onStep('第一次点击后 10 秒内页面未开始处理，按同一按钮补点一次');
+    await clickExactText(page, button.label || 'Subscribe', { ...clickOptions, timeoutMilliseconds: 3000 });
+    state = await waitForValue(progressed, Boolean, 10000, '补点后页面仍未开始处理支付');
+    onStep(describeSubscribeProgress(state, '补点后'));
+  }
+  if (state.error) throw new Error(state.error);
+  if (state.success) {
+    onStep(usedRetry ? '补点后支付已完成，无需再等 90 秒' : '第一次点击后支付已完成，无需再等 90 秒');
+    return state;
+  }
+
+  const startedAt = Date.now();
+  onStep('支付处理中，等待成功或拒付（最多 90 秒）');
   const outcome = await waitForValue(
-    () => readSubscribeOutcome(page),
-    (state) => Boolean(state?.error || state?.success),
-    45000,
-    // 等待拒付横幅或离开 checkout；超时后当前任务失败并关闭该 Profile，不影响其他并发任务。
-    '已点击 Subscribe，但 45 秒内没有出现支付成功或拒付提示',
+    () => readSubscribeProgress(page, debugPort),
+    (item) => Boolean(item?.error || item?.success),
+    SUBSCRIBE_RESULT_WAIT_MILLISECONDS,
+    // 支付网关确认可能超过 45 秒；90 秒内既不跳转也不拒付则当前任务失败，整条任务仍受 3 分钟上限约束。
+    '已点击 Subscribe，但 90 秒内没有出现支付成功或拒付提示',
   );
-  if (outcome.error) throw new Error(outcome.error);
+  const waitedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+  const clickSource = usedRetry ? '补点后' : '第一次点击后';
+  if (outcome.error) {
+    onStep(`${clickSource}等待 ${waitedSeconds} 秒后出现拒付`);
+    throw new Error(outcome.error);
+  }
+  onStep(`${clickSource}等待 ${waitedSeconds} 秒后支付成功`);
   return outcome;
 }
 
@@ -936,7 +1167,7 @@ function hasBillingAddressInRow(row) {
 async function verifyExistingStripeBillingAddress(debugPort) {
   const target = await waitForStripeTarget(
     debugPort,
-    /elements-inner-address.*componentName=address/i,
+    STRIPE_ADDRESS_TARGET_PATTERN,
     '#billingAddress-nameInput, input[name="name"]',
     'Stripe Billing address 输入框',
   );
@@ -993,21 +1224,283 @@ async function verifyExistingStripeBillingAddress(debugPort) {
   }
 }
 
+function readBottomLeftProfilePointExpression() {
+  return `(() => {
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visible = (node) => {
+      if (!node) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 8 && rect.height > 8 && getComputedStyle(node).visibility !== 'hidden';
+    };
+    // 只查左下角可点击节点，不要扫整页 DOM。首页已经出来就应该立刻能点到头像。
+    const inBottomLeft = (rect) => rect.left < Math.min(420, innerWidth * 0.45) && rect.bottom > innerHeight * 0.55;
+    const blocked = /^(Upgrade|New chat|Search chats|Log out|Settings|Help|Library|Projects|Scheduled|Plugins|More)$/i;
+    const storeLike = /GPT Store|Explore GPTs|\\bSora\\b/i;
+    const candidates = [...document.querySelectorAll('button,a,[role="button"],[aria-haspopup="menu"],[aria-haspopup="true"]')]
+      .filter((node) => {
+        if (node.disabled || !visible(node)) return false;
+        const rect = node.getBoundingClientRect();
+        if (!inBottomLeft(rect)) return false;
+        const label = normalize(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
+        if (blocked.test(label) || /\\bupgrade\\b/i.test(label) || storeLike.test(label)) return false;
+        return Boolean(label) || node.getAttribute('aria-haspopup');
+      })
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        const label = normalize(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
+        return {
+          hasPlan: /\\b(Pro|Plus|Free|Business|Team|Go|Enterprise)\\b/i.test(label),
+          x: rect.left + Math.min(28, Math.max(14, rect.width * 0.12)),
+          y: rect.top + Math.min(rect.height / 2, 28),
+          top: rect.top,
+          width: rect.width,
+        };
+      });
+    candidates.sort((left, right) => Number(right.hasPlan) - Number(left.hasPlan) || right.width - left.width || right.top - left.top);
+    return {
+      point: candidates[0] || null,
+      viewport: {width: innerWidth, height: innerHeight},
+    };
+  })()`;
+}
+
+async function readSettingsMenuState(page) {
+  return evaluate(page, `(() => {
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visible = (node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
+    };
+    return [...document.querySelectorAll('button,a,[role="button"],[role="menuitem"]')]
+      .some((node) => !node.disabled && visible(node) && normalize(node.innerText || node.textContent || node.getAttribute('aria-label')) === 'Settings');
+  })()`);
+}
+
+async function readSettingsDialogState(page) {
+  return evaluate(page, `(() => {
+    const bodyText = document.body?.innerText || '';
+    return bodyText.includes('General') && bodyText.includes('Billing') && (bodyText.includes('Search settings') || bodyText.includes('Appearance'));
+  })()`);
+}
+
+async function readBillingPanelState(page) {
+  return evaluate(page, `(() => {
+    const bodyText = document.body?.innerText || '';
+    return bodyText.includes('Billing email')
+      || /ChatGPT (Pro|Plus|Team|Business|Go)|Your plan auto-renews|Change plan/i.test(bodyText);
+  })()`);
+}
+
+function readBillingProofLayoutExpression() {
+  return `(() => {
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visible = (node) => {
+      if (!node) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    const panel = panels.find((node) => /content-Billing$/i.test(node.id || ''))
+      || panels.find((node) => (node.innerText || '').includes('Billing email'));
+    const scope = panel || document;
+    const nodes = [...scope.querySelectorAll('*')].filter(visible);
+    const pickSmallest = (re, maxLen) => nodes
+      .filter((node) => {
+        const text = normalize(node.innerText || node.textContent);
+        return re.test(text) && text.length <= maxLen;
+      })
+      .sort((left, right) => left.getBoundingClientRect().height - right.getBoundingClientRect().height)[0];
+    const plan = pickSmallest(/ChatGPT (Pro|Plus|Team|Business|Go)|Your plan auto-renews|Current plan/i, 90);
+    const emailBlock = pickSmallest(/Billing email/i, 120);
+    const box = (node) => {
+      if (!node) return null;
+      const rect = node.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height };
+    };
+    const panelRect = panel?.getBoundingClientRect();
+    const planBox = box(plan);
+    const emailBox = box(emailBlock);
+    const pad = 4;
+    const inside = (item) => Boolean(item && panelRect
+      && item.top >= panelRect.top - pad
+      && item.bottom <= panelRect.bottom + pad);
+    return {
+      hasPanel: Boolean(panel),
+      hasPlan: Boolean(plan),
+      hasEmail: Boolean(emailBlock),
+      planInView: inside(planBox),
+      emailInView: inside(emailBox),
+      needDown: Boolean(emailBox && panelRect && emailBox.bottom > panelRect.bottom - pad),
+      needUp: Boolean(planBox && panelRect && planBox.top < panelRect.top + pad),
+      wheelPoint: panelRect ? {
+        x: panelRect.left + panelRect.width / 2,
+        y: panelRect.top + Math.min(panelRect.height * 0.55, panelRect.height - 24),
+      } : null,
+    };
+  })()`;
+}
+
+async function scrollBillingProofIntoView(page, onStep = () => {}) {
+  onStep('稍微滑动 Billing，让套餐和邮箱进入截图');
+  await waitForValue(
+    () => evaluate(page, readBillingProofLayoutExpression()),
+    (state) => state?.hasPanel && (state?.hasPlan || state?.hasEmail),
+    10000,
+    // 等待 Billing 面板出现套餐或邮箱文案；超时只影响截图，不能把已扣款任务改成失败重试。
+    'Billing 已打开，但没有出现套餐或 Billing email',
+  );
+  // 只轻轻向下滚，距离为原先 140 的三分之一；滚完就截图，不要为了对齐反复找位置。
+  for (let index = 0; index < 3; index += 1) {
+    const layout = await evaluate(page, readBillingProofLayoutExpression());
+    if (layout?.planInView && layout?.emailInView) return layout;
+    if (!layout?.wheelPoint) break;
+    const deltaY = layout.needUp && !layout.needDown ? -47 : 47;
+    await page.command('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: layout.wheelPoint.x,
+      y: layout.wheelPoint.y,
+      deltaX: 0,
+      deltaY,
+    });
+    await sleep(250);
+  }
+  return evaluate(page, readBillingProofLayoutExpression());
+}
+
+async function saveViewportScreenshot(page, fileName) {
+  await page.command('Page.enable').catch(() => {});
+  const result = await page.command('Page.captureScreenshot', { format: 'png', fromSurface: true });
+  if (!result?.data) throw new Error('CDP 没有返回图片数据');
+  await mkdir(screenshotDirectory, { recursive: true });
+  const safeName = String(fileName || '').replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safeName.endsWith('.png')) throw new Error('截图文件名无效');
+  await writeFile(join(screenshotDirectory, safeName), Buffer.from(result.data, 'base64'));
+  return `/api/screenshots/${safeName}`;
+}
+
+async function ensureHomePageForBillingProof(page, debugPort, onStep = () => {}) {
+  const targets = await getTargets(debugPort).catch(() => []);
+  const homeTarget = targets.find(isChatGptHomeTarget);
+  const checkoutOpen = targets.some((item) => item?.type === 'page' && /\/checkout\//i.test(item.url || ''));
+  // 支付成功后同一标签会变成首页；先看标签 URL，不要卡在旧 checkout 文档的 evaluate 上。
+  if (homeTarget && !checkoutOpen) {
+    const href = await evaluate(page, 'location.href', false, 2000).catch(() => '');
+    if (isChatGptHomeUrl(href)) {
+      onStep('充值完成，已自动回到 chatgpt.com 首页');
+      return { page, extra: null };
+    }
+    onStep('充值完成，首页已打开，立即查找左下角头像');
+    const homePage = await connectCdp(homeTarget.webSocketDebuggerUrl);
+    await homePage.command('Page.enable').catch(() => {});
+    await homePage.command('Runtime.enable').catch(() => {});
+    return { page: homePage, extra: homePage };
+  }
+  const href = await evaluate(page, 'location.href', false, 2000).catch(() => '');
+  if (isChatGptHomeUrl(href)) {
+    onStep('充值完成，已自动回到 chatgpt.com 首页');
+    return { page, extra: null };
+  }
+  onStep('充值完成，返回 chatgpt.com 首页');
+  const navigation = await page.command('Page.navigate', { url: 'https://chatgpt.com/' });
+  if (navigation?.errorText) throw new Error(`返回 ChatGPT 首页失败：${navigation.errorText}`);
+  return { page, extra: null };
+}
+
+async function captureAccountBillingProof(page, { jobId, index, debugPort }, onStep = () => {}) {
+  let extra = null;
+  try {
+    const attached = await ensureHomePageForBillingProof(page, debugPort, onStep);
+    const homePage = attached.page;
+    extra = attached.extra;
+    onStep('首页已打开，立即查找并点击左下角头像');
+    const profilePoint = await waitForValue(
+      () => evaluate(homePage, readBottomLeftProfilePointExpression()),
+      (state) => Boolean(state?.point)
+        && state.point.x >= 0 && state.point.x <= state.viewport.width
+        && state.point.y >= 0 && state.point.y <= state.viewport.height,
+      8000,
+      // 头像在首页侧栏底部，页面已经刷出来就该立刻能点；超时只影响截图，不能把已扣款任务改成失败重试。
+      '充值完成后已返回 chatgpt.com，但没有出现左下角头像',
+    );
+    await mouseClick(homePage, profilePoint.point);
+    try {
+      await waitForValue(() => readSettingsMenuState(homePage), Boolean, 8000, '左下角头像已点击，但没有出现 Settings');
+    } catch (firstError) {
+      // 头像菜单可能被水合吞掉第一次点击；只补点头像一次，不重跑整条任务。
+      const retryPoint = await evaluate(homePage, readBottomLeftProfilePointExpression());
+      if (!retryPoint?.point) throw firstError;
+      await mouseClick(homePage, retryPoint.point);
+      await waitForValue(() => readSettingsMenuState(homePage), Boolean, 8000, firstError.message);
+    }
+
+    onStep('点击 Settings');
+    await clickAndConfirm(
+      homePage,
+      'Settings',
+      {
+        timeoutMilliseconds: 10000,
+        timeoutMessage: '头像菜单里没有找到可点击的 Settings',
+        stabilityMilliseconds: 600,
+      },
+      () => readSettingsDialogState(homePage),
+      10000,
+      'Settings 已点击，但设置弹窗没有打开',
+    );
+
+    onStep('点击 Billing');
+    await clickAndConfirm(
+      homePage,
+      'Billing',
+      {
+        region: 'left',
+        timeoutMilliseconds: 10000,
+        timeoutMessage: '设置弹窗里没有找到可点击的 Billing',
+        stabilityMilliseconds: 600,
+      },
+      () => readBillingPanelState(homePage),
+      10000,
+      'Billing 已点击，但账单内容没有出现',
+    );
+
+    await scrollBillingProofIntoView(homePage, onStep);
+
+    onStep('截取套餐和邮箱');
+    await sleep(600);
+    const fileName = `${jobId || 'job'}-${Number(index) || 0}.png`;
+    const screenshotUrl = await saveViewportScreenshot(homePage, fileName);
+    return { screenshotUrl };
+  } catch (error) {
+    // 此时 Subscribe 已经成功，截图失败不能把任务打进失败重试列表，否则会重复扣款。
+    onStep(`账户 Billing 截图失败：${error.message}`);
+    return { screenshotUrl: '', screenshotError: error.message };
+  } finally {
+    if (extra) extra.close();
+  }
+}
+
 async function fillLoginIfNeeded(page, row, onStatus) {
   const entryState = await waitForValue(
     () => evaluate(page, `(() => {
       const visible = (node) => { if (!node) return false; const rect = node.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; };
       const emailInput = document.querySelector('input[type="email"], input[name="email"]');
-      const topRightUpgrade = [...document.querySelectorAll('button,a,[role="button"]')].some((node) => {
+      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const inTopRight = (rect) => rect.left > innerWidth * 0.55 && rect.top < Math.min(220, innerHeight * 0.35);
+      const homeEntry = [...document.querySelectorAll('button,a,[role="button"]')].some((node) => {
         const rect = node.getBoundingClientRect();
-        const text = (node.innerText || node.textContent || node.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-        return visible(node) && text === 'Upgrade' && rect.left > innerWidth * 0.55 && rect.top < Math.min(220, innerHeight * 0.35);
+        const text = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
+        if (!visible(node) || node.disabled) return false;
+        if (text === 'Upgrade' && inTopRight(rect)) return true;
+        if (text === 'Free offer' && inTopRight(rect)) return true;
+        return text === 'Claim offer';
       });
-      return {hasEmailInput: visible(emailInput), topRightUpgrade};
+      return {hasEmailInput: visible(emailInput), homeEntry};
     })()`),
-    (state) => state?.hasEmailInput || state?.topRightUpgrade,
+    (state) => state?.hasEmailInput || state?.homeEntry,
     45000,
-    'ChatGPT 首页已打开，但既没有出现登录框，也没有出现右上角 Upgrade',
+    'ChatGPT 首页已打开，但既没有出现登录框，也没有出现右上角 Upgrade / Free offer 或 Claim offer',
   );
   if (!entryState.hasEmailInput) return;
 
@@ -1024,7 +1517,7 @@ async function fillLoginIfNeeded(page, row, onStatus) {
   onStatus('已用键盘输入账号密码；若出现邮箱验证码或 MFA，请在 AdsPower 中人工完成');
 }
 
-async function openChatGptAndPreparePayment(profile, row, product, multiplier, onStatus, onPlans, onStep) {
+async function openChatGptAndPreparePayment(profile, row, product, multiplier, onStatus, onPlans, onStep, proofContext = {}) {
   const page = await connectChatGptPage(profile.debugPort);
   try {
     await page.command('Page.enable');
@@ -1073,16 +1566,30 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
     onStep('等待 ChatGPT 首页完全加载并稳定');
     await sleep(1200);
 
-    onStep('点击右上角 Upgrade');
+    onStep('识别首页升级入口');
+    // 优先右上角 Upgrade，没有则 Free offer，再没有则 Claim offer；超时说明入口未出现，当前任务失败。
+    const entry = await waitForValue(
+      () => readHomeUpgradeEntry(page),
+      Boolean,
+      45000,
+      'ChatGPT 首页已打开，但没有找到右上角 Upgrade、Free offer 或 Claim offer',
+    );
+    onStep(`点击${entry.region === 'top-right' ? '右上角 ' : ''}${entry.text}`);
     await clickAndConfirm(
       page,
-      'Upgrade',
-      { region: 'top-right', timeoutMilliseconds: 45000, timeoutMessage: '没有找到右上角 Upgrade', stabilityMilliseconds: 1000 },
+      entry.text,
+      {
+        region: entry.region,
+        timeoutMilliseconds: 20000,
+        timeoutMessage: `没有找到可点击的 ${entry.text}`,
+        stabilityMilliseconds: 1000,
+        scrollIntoView: entry.region !== 'top-right',
+      },
       () => readPricingModalState(page),
       10000,
-      '右上角 Upgrade 已点击，但 URL 和套餐弹窗都没有变化',
+      `${entry.text} 已点击，但 URL 和套餐弹窗都没有变化`,
     );
-    onStep('右上角 Upgrade 已点击，套餐弹窗已加载');
+    onStep(`${entry.text} 已点击，套餐弹窗已加载`);
 
     onStep('向下滚动到套餐页面底部，寻找 See all plans');
     onStep('点击 See all plans');
@@ -1090,6 +1597,7 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
       page,
       'See all plans',
       {
+        alternateTexts: ['See all'],
         timeoutMilliseconds: 20000,
         timeoutMessage: '滚动套餐页面后仍没有找到可见的 See all plans',
         stabilityMilliseconds: 800,
@@ -1126,19 +1634,21 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
     }
 
     onStep('账单地址已填写，点击 Subscribe');
-    await clickSubscribeAndAwaitResult(page, onStep);
+    await clickSubscribeAndAwaitResult(page, profile.debugPort, onStep);
     onStep('Subscribe 已提交，未出现拒付');
+    return captureAccountBillingProof(page, { ...proofContext, debugPort: profile.debugPort }, onStep);
   } finally {
     page.close();
   }
 }
 
-async function runWithConcurrency(rows, concurrency, worker) {
+async function runWithConcurrency(rows, concurrency, worker, shouldStop = () => false) {
   const results = new Array(rows.length);
   let cursor = 0;
   const poolSize = Math.min(rows.length, concurrency);
   const takeNextIndex = () => {
     // 领取下标必须同步完成，不能在 await 之后再加游标，否则会超过设定并发。
+    if (shouldStop()) return -1;
     if (cursor >= rows.length) return -1;
     const index = cursor;
     cursor += 1;
@@ -1171,6 +1681,7 @@ function validatePaymentRow(row) {
 }
 
 export async function runUpgradeJob({
+  jobId,
   rows,
   concurrency = 1,
   product = 'Maximum power',
@@ -1178,43 +1689,111 @@ export async function runUpgradeJob({
   apiBase,
   apiKey,
   onEvent = () => {},
+  shouldStop = () => false,
 }) {
   if (!PRODUCTS.includes(product)) throw new Error(`不支持的 GPT 产品：${product}`);
   if (!MULTIPLIERS.includes(multiplier)) throw new Error(`不支持的倍率：${multiplier}`);
 
   const boundedConcurrency = Math.max(1, Math.min(10, Number(concurrency) || 1));
-  return runWithConcurrency(rows, boundedConcurrency, async (row, index) => {
+  const results = await runWithConcurrency(rows, boundedConcurrency, async (row, index) => {
     const serialNumber = String(row.adsPowerSerialNumber || '').trim();
     const uiIndex = Number.isInteger(row.__uiIndex) ? row.__uiIndex : index;
     const prefix = `第 ${uiIndex + 1} 条 / AdsPower ${serialNumber}`;
     let profile;
     let currentStep = '任务校验';
-    try {
+    let active = true;
+    let timeoutId;
+    const stopBrowser = () => stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
+    const emit = (payload) => {
+      if (!active) return;
+      onEvent(payload);
+    };
+
+    const runRow = async () => {
       // 卡、账号和账单地址始终来自同一任务行，禁止跨行借用。
       validatePaymentRow(row);
       currentStep = '启动 AdsPower';
-      onEvent({ type: 'row_started', index: uiIndex, message: `${prefix}：启动 AdsPower` });
+      emit({ type: 'row_started', index: uiIndex, message: `${prefix}：启动 AdsPower` });
       profile = await startAdsPowerProfile({ serialNumber, apiBase, apiKey });
-      onEvent({ type: 'browser_started', index: uiIndex, message: `${prefix}：已打开 AdsPower，进入 chatgpt.com` });
+      if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
+      emit({ type: 'browser_started', index: uiIndex, message: `${prefix}：已打开 AdsPower，进入 chatgpt.com` });
 
-      await openChatGptAndPreparePayment(profile, row, product, multiplier, (message) => {
-        onEvent({ type: 'login_verification_required', index: uiIndex, message: `${prefix}：${message}` });
-      }, (plans) => onEvent({ type: 'plans_discovered', index: uiIndex, plans }), (step) => {
+      const proof = await openChatGptAndPreparePayment(profile, row, product, multiplier, (message) => {
+        emit({ type: 'login_verification_required', index: uiIndex, message: `${prefix}：${message}` });
+      }, (plans) => emit({ type: 'plans_discovered', index: uiIndex, plans }), (step) => {
+        if (!active) return;
         currentStep = step;
-        onEvent({ type: 'step_started', index: uiIndex, message: `${prefix}：${step}` });
-      });
+        emit({ type: 'step_started', index: uiIndex, message: `${prefix}：${step}` });
+      }, { jobId, index: uiIndex });
+      if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
+      return proof || {};
+    };
 
-      // 支付结果已确定后关闭当前 Profile；拒付或成功都只影响这一条，不关闭其他并发任务。
-      if (profile) await stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
-      onEvent({ type: 'row_succeeded', index: uiIndex, message: `${prefix}：${product} / ${multiplier} 已点击 Subscribe，未出现拒付` });
-      return { index: uiIndex, serialNumber, status: 'succeeded' };
+    // 从本条任务开始执行起计 3 分钟；Subscribe 提交后页面可能长时间转圈，超时立刻关浏览器并释放并发空位。
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        active = false;
+        stopBrowser();
+        reject(new Error(ROW_TIMEOUT_MESSAGE));
+      }, ROW_TIMEOUT_MILLISECONDS);
+    });
+    const work = runRow();
+    work.catch(() => {});
+    try {
+      const proof = await Promise.race([work, timeout]);
+      clearTimeout(timeoutId);
+      if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
+      if (!proof?.screenshotUrl) throw new Error(proof?.screenshotError || 'Billing 截图未完成');
+      // 截图完成后再把任务标为已完成，然后才关闭当前 Profile。
+      onEvent({
+        type: 'row_succeeded',
+        index: uiIndex,
+        screenshotUrl: proof.screenshotUrl,
+        screenshotError: '',
+        message: `${prefix}：${product} / ${multiplier} 已点击 Subscribe，Billing 截图已保存`,
+      });
+      await stopBrowser();
+      return { index: uiIndex, serialNumber, status: 'succeeded', screenshotUrl: proof.screenshotUrl };
     } catch (error) {
-      const reason = `${currentStep}失败：${error.message}`;
-      if (profile) await stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
+      clearTimeout(timeoutId);
+      const timedOut = !active || String(error.message || '').includes(ROW_TIMEOUT_MESSAGE);
+      const afterPayment = /Subscribe 已提交|第一次点击|补点|支付处理中|支付成功|充值完成|左下角头像|点击 Settings|点击 Billing|稍微滑动|截取套餐和邮箱|Billing 截图/.test(currentStep);
+      if (afterPayment) {
+        // Subscribe 已经成功；截图阶段超时或失败不能打进失败重试，避免重复扣款。
+        const screenshotError = timedOut ? ROW_TIMEOUT_MESSAGE : error.message;
+        active = false;
+        onEvent({
+          type: 'row_succeeded',
+          index: uiIndex,
+          screenshotUrl: '',
+          screenshotError,
+          message: `${prefix}：${product} / ${multiplier} 已点击 Subscribe，未出现拒付；Billing 截图未完成：${screenshotError}`,
+        });
+        await stopBrowser();
+        return { index: uiIndex, serialNumber, status: 'succeeded', screenshotError };
+      }
+      const reason = timedOut
+        ? `${currentStep}失败：${ROW_TIMEOUT_MESSAGE}`
+        : `${currentStep}失败：${error.message}`;
+      active = false;
+      await stopBrowser();
       onEvent({ type: 'row_failed', index: uiIndex, message: `${prefix}：${reason}；已终止该条任务并关闭浏览器` });
       return { index: uiIndex, serialNumber, status: 'failed', error: reason };
     } finally {
-      if (row.stopProfile && profile) await stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
+      clearTimeout(timeoutId);
+      if (row.stopProfile) await stopBrowser();
     }
-  });
+  }, shouldStop);
+
+  // 终止后只取消尚未领取的排队任务；已在跑的条目会正常写进 results。
+  for (let index = 0; index < rows.length; index += 1) {
+    if (results[index]) continue;
+    const row = rows[index];
+    const serialNumber = String(row.adsPowerSerialNumber || '').trim();
+    const uiIndex = Number.isInteger(row.__uiIndex) ? row.__uiIndex : index;
+    const prefix = `第 ${uiIndex + 1} 条 / AdsPower ${serialNumber}`;
+    results[index] = { index: uiIndex, serialNumber, status: 'cancelled' };
+    onEvent({ type: 'row_cancelled', index: uiIndex, message: `${prefix}：排队任务已终止，未开始执行` });
+  }
+  return results;
 }

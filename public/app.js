@@ -4,6 +4,7 @@ let rows = [];
 const rowStates = [];
 let failedIndexes = [];
 let jobRunning = false;
+let stopRequested = false;
 const defaultSettings = { apiBase: 'http://127.0.0.1:50325', apiKey: '' };
 function storedSettings() {
   try { return JSON.parse(localStorage.getItem('gpt-upgrade-settings') || '{}'); }
@@ -120,16 +121,25 @@ function billingAddressText(row) {
     .filter(Boolean)
     .join(', ');
 }
+function canRetryRow(index) {
+  const state = rowStates[index] || {};
+  return !jobRunning && state.status !== '执行中';
+}
 function renderRows() {
   $('#task-body').innerHTML = rows.map((row, index) => {
     const state = rowStates[index] || {};
     const reason = state.reason || '';
     const reasonAttr = reason ? ` class="reason-cell" data-reason="${escapeHtml(reason)}" title="单击放大"` : '';
-    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td><td>${escapeHtml(row.password)}</td><td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.status || '待执行')}</td><td${reasonAttr}>${escapeHtml(reason)}</td></tr>`;
+    const retryDisabled = canRetryRow(index) ? '' : ' disabled';
+    const screenshot = state.screenshotUrl
+      ? `<button type="button" class="row-shot" data-screenshot="${escapeHtml(state.screenshotUrl)}" title="单击放大"><img src="${escapeHtml(state.screenshotUrl)}" alt="Billing 截图"></button>`
+      : escapeHtml(state.screenshotError ? '截图失败' : '');
+    const copyDisabled = state.screenshotUrl ? '' : ' disabled';
+    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td><td>${escapeHtml(row.password)}</td><td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.status || '待执行')}</td><td${reasonAttr}>${escapeHtml(reason)}</td><td><button type="button" class="row-retry" data-retry-index="${index}"${retryDisabled}>重试</button></td><td><button type="button" class="row-copy" data-copy-screenshot="${escapeHtml(state.screenshotUrl || '')}"${copyDisabled}>复制</button></td><td>${screenshot}</td></tr>`;
   }).join('');
   $('#task-count').textContent = `${rows.length} 条`;
   $('#task-table-wrap').classList.toggle('scrollable', rows.length > 10);
-  $('#task-list').hidden = false; $('#start').disabled = jobRunning || rows.length === 0; $('#retry-failed').disabled = jobRunning || failedIndexes.length === 0;
+  $('#task-list').hidden = false; $('#start').disabled = jobRunning || rows.length === 0; $('#retry-failed').disabled = jobRunning || failedIndexes.length === 0; $('#stop-all').disabled = !jobRunning || stopRequested;
 }
 function loadSettingsForm() { $('#adspower-api-base').value = settings.apiBase; $('#adspower-api-key').value = settings.apiKey; }
 $('#settings-open').addEventListener('click', () => { loadSettingsForm(); $('#settings-dialog').showModal(); });
@@ -164,28 +174,93 @@ function appendEventLog(payload) {
   $('#events').classList.toggle('scrollable', $('#events').children.length > 10);
 }
 fetch('/api/logs').then((response) => response.ok ? response.json() : []).then((logs) => logs.forEach(appendEventLog)).catch(() => {});
-const events = new EventSource('/api/events'); events.onmessage = (event) => { const payload = JSON.parse(event.data); $('#activity').textContent = payload.message || payload.type; if (payload.type === 'job_finished' || payload.type === 'job_failed') { jobRunning = false; renderRows(); } if (Number.isInteger(payload.index) && rowStates[payload.index]) { if (payload.type === 'row_started' || payload.type === 'browser_started') rowStates[payload.index] = {status:'执行中', reason:''}; if (payload.type === 'row_failed') { rowStates[payload.index] = {status:'失败', reason:payload.message || '未知异常'}; failedIndexes = [...new Set([...failedIndexes, payload.index])]; } if (payload.type === 'row_succeeded') { rowStates[payload.index] = {status:'已完成', reason:''}; failedIndexes = failedIndexes.filter((index) => index !== payload.index); } if (payload.type === 'payment_confirmation_required') { rowStates[payload.index] = {status:'待人工支付', reason:''}; failedIndexes = failedIndexes.filter((index) => index !== payload.index); } renderRows(); } if (payload.type === 'plans_discovered' && Array.isArray(payload.plans)) { $('#discovered-plans').hidden = false; $('#discovered-plans').innerHTML = `<span>浏览器识别到的个人版套餐：</span> ${payload.plans.map((plan) => `<b>${escapeHtml(plan.title)}</b>`).join(' · ')}`; } appendEventLog(payload); };
+const events = new EventSource('/api/events'); events.onmessage = (event) => { const payload = JSON.parse(event.data); $('#activity').textContent = payload.message || payload.type; if (payload.type === 'job_stop_requested') { stopRequested = true; renderRows(); } if (payload.type === 'job_finished' || payload.type === 'job_failed') { jobRunning = false; stopRequested = false; renderRows(); } if (Number.isInteger(payload.index) && rowStates[payload.index]) { if (payload.type === 'row_started' || payload.type === 'browser_started') rowStates[payload.index] = {status:'执行中', reason:'', screenshotUrl:'', screenshotError:''}; if (payload.type === 'row_failed') { rowStates[payload.index] = {status:'失败', reason:payload.message || '未知异常', screenshotUrl:rowStates[payload.index].screenshotUrl || '', screenshotError:rowStates[payload.index].screenshotError || ''}; failedIndexes = [...new Set([...failedIndexes, payload.index])]; } if (payload.type === 'row_succeeded') { rowStates[payload.index] = {status:'已完成', reason:'', screenshotUrl:payload.screenshotUrl || '', screenshotError:payload.screenshotError || ''}; failedIndexes = failedIndexes.filter((index) => index !== payload.index); } if (payload.type === 'row_cancelled') { rowStates[payload.index] = {status:'已取消', reason:payload.message || '排队任务已终止，未开始执行'}; failedIndexes = failedIndexes.filter((index) => index !== payload.index); } if (payload.type === 'payment_confirmation_required') { rowStates[payload.index] = {status:'待人工支付', reason:''}; failedIndexes = failedIndexes.filter((index) => index !== payload.index); } renderRows(); } if (payload.type === 'plans_discovered' && Array.isArray(payload.plans)) { $('#discovered-plans').hidden = false; $('#discovered-plans').innerHTML = `<span>浏览器识别到的个人版套餐：</span> ${payload.plans.map((plan) => `<b>${escapeHtml(plan.title)}</b>`).join(' · ')}`; } appendEventLog(payload); };
 function hideReasonZoom() {
   const zoom = $('#reason-zoom');
   zoom.hidden = true;
   zoom.textContent = '';
 }
+function hideScreenshotZoom() {
+  const zoom = $('#screenshot-zoom');
+  zoom.hidden = true;
+  const image = zoom.querySelector('img');
+  if (image) image.removeAttribute('src');
+}
 function showReasonZoom(text) {
+  hideScreenshotZoom();
   const zoom = $('#reason-zoom');
   zoom.hidden = false;
   zoom.textContent = text;
 }
+function showScreenshotZoom(url) {
+  hideReasonZoom();
+  const zoom = $('#screenshot-zoom');
+  const image = zoom.querySelector('img');
+  image.src = url;
+  zoom.hidden = false;
+}
+async function copyScreenshot(url, button) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('截图已失效，请重新跑完订阅后再复制');
+    const blob = await response.blob();
+    const png = blob.type === 'image/png' ? blob : new Blob([blob], { type: 'image/png' });
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+    button.textContent = '已复制';
+    $('#activity').textContent = '截图已复制到剪贴板';
+    setTimeout(() => { button.textContent = '复制'; }, 1600);
+  } catch (error) {
+    button.textContent = '复制失败';
+    $('#activity').textContent = error.message || '复制截图失败';
+    setTimeout(() => { button.textContent = '复制'; }, 1600);
+  }
+}
 $('#task-body').addEventListener('click', (event) => {
+  const retryButton = event.target.closest('[data-retry-index]');
+  if (retryButton) {
+    event.stopPropagation();
+    const index = Number(retryButton.getAttribute('data-retry-index'));
+    if (!Number.isInteger(index) || !rows[index] || !canRetryRow(index)) return;
+    // 单行重试只提交当前行，复用首次绑定的账号、卡和地址，不借用其他行。
+    startJob([{...rows[index], __uiIndex:index}]);
+    return;
+  }
+  const copyButton = event.target.closest('[data-copy-screenshot]');
+  if (copyButton) {
+    event.stopPropagation();
+    const url = copyButton.getAttribute('data-copy-screenshot') || '';
+    if (!url || copyButton.disabled) return;
+    copyScreenshot(url, copyButton);
+    return;
+  }
+  const shot = event.target.closest('[data-screenshot]');
+  if (shot) {
+    event.stopPropagation();
+    showScreenshotZoom(shot.getAttribute('data-screenshot') || '');
+    return;
+  }
   const cell = event.target.closest('[data-reason]');
   if (!cell) return;
   event.stopPropagation();
   showReasonZoom(cell.getAttribute('data-reason') || '');
 });
 document.addEventListener('click', (event) => {
-  if (event.target.closest('[data-reason]')) return;
+  if (event.target.closest('[data-reason]') || event.target.closest('[data-screenshot]') || event.target.closest('[data-copy-screenshot]') || event.target.closest('#screenshot-zoom')) return;
   hideReasonZoom();
+  hideScreenshotZoom();
 });
-async function startJob(taskRows) { jobRunning = true; renderRows(); $('#activity').textContent = '正在启动任务'; const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rows:taskRows, concurrency:Number($('#concurrency').value), product:$('#product').value, multiplier:document.querySelector('input[name="multiplier"]:checked').value, apiBase:settings.apiBase, apiKey:settings.apiKey})}); if (!response.ok) { const body = await response.json(); jobRunning = false; $('#validation').hidden = false; $('#validation').textContent = body.error || '任务启动失败'; renderRows(); } }
+async function startJob(taskRows) { jobRunning = true; stopRequested = false; renderRows(); $('#activity').textContent = '正在启动任务'; const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rows:taskRows, concurrency:Number($('#concurrency').value), product:$('#product').value, multiplier:document.querySelector('input[name="multiplier"]:checked').value, apiBase:settings.apiBase, apiKey:settings.apiKey})}); if (!response.ok) { const body = await response.json(); jobRunning = false; stopRequested = false; $('#validation').hidden = false; $('#validation').textContent = body.error || '任务启动失败'; renderRows(); } }
 $('#start').addEventListener('click', () => startJob(rows));
 $('#retry-failed').addEventListener('click', () => { const retryRows = failedIndexes.map((index) => ({...rows[index], __uiIndex:index})); if (retryRows.length) startJob(retryRows); });
+$('#stop-all').addEventListener('click', async () => {
+  stopRequested = true;
+  renderRows();
+  const response = await fetch('/api/jobs/stop', {method:'POST'});
+  if (!response.ok) {
+    stopRequested = false;
+    renderRows();
+    $('#validation').hidden = false;
+    $('#validation').textContent = '终止排队任务失败';
+  }
+});
 renderBillingStates();
