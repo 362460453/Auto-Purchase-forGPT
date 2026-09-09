@@ -1291,83 +1291,19 @@ async function readBillingPanelState(page) {
   })()`);
 }
 
-function readBillingProofLayoutExpression() {
-  return `(() => {
-    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-    const visible = (node) => {
-      if (!node) return false;
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    };
-    const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter((node) => {
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-    const panel = panels.find((node) => /content-Billing$/i.test(node.id || ''))
-      || panels.find((node) => (node.innerText || '').includes('Billing email'));
-    const scope = panel || document;
-    const nodes = [...scope.querySelectorAll('*')].filter(visible);
-    const pickSmallest = (re, maxLen) => nodes
-      .filter((node) => {
-        const text = normalize(node.innerText || node.textContent);
-        return re.test(text) && text.length <= maxLen;
-      })
-      .sort((left, right) => left.getBoundingClientRect().height - right.getBoundingClientRect().height)[0];
-    const plan = pickSmallest(/ChatGPT (Pro|Plus|Team|Business|Go)|Your plan auto-renews|Current plan/i, 90);
-    const emailBlock = pickSmallest(/Billing email/i, 120);
-    const box = (node) => {
-      if (!node) return null;
-      const rect = node.getBoundingClientRect();
-      return { top: rect.top, bottom: rect.bottom, height: rect.height };
-    };
-    const panelRect = panel?.getBoundingClientRect();
-    const planBox = box(plan);
-    const emailBox = box(emailBlock);
-    const pad = 4;
-    const inside = (item) => Boolean(item && panelRect
-      && item.top >= panelRect.top - pad
-      && item.bottom <= panelRect.bottom + pad);
-    return {
-      hasPanel: Boolean(panel),
-      hasPlan: Boolean(plan),
-      hasEmail: Boolean(emailBlock),
-      planInView: inside(planBox),
-      emailInView: inside(emailBox),
-      needDown: Boolean(emailBox && panelRect && emailBox.bottom > panelRect.bottom - pad),
-      needUp: Boolean(planBox && panelRect && planBox.top < panelRect.top + pad),
-      wheelPoint: panelRect ? {
-        x: panelRect.left + panelRect.width / 2,
-        y: panelRect.top + Math.min(panelRect.height * 0.55, panelRect.height - 24),
-      } : null,
-    };
-  })()`;
-}
 
 async function scrollBillingProofIntoView(page, onStep = () => {}) {
-  onStep('稍微滑动 Billing，让套餐和邮箱进入截图');
-  await waitForValue(
-    () => evaluate(page, readBillingProofLayoutExpression()),
-    (state) => state?.hasPanel && (state?.hasPlan || state?.hasEmail),
-    10000,
-    // 等待 Billing 面板出现套餐或邮箱文案；超时只影响截图，不能把已扣款任务改成失败重试。
-    'Billing 已打开，但没有出现套餐或 Billing email',
-  );
-  // 只轻轻向下滚，距离为原先 140 的三分之一；滚完就截图，不要为了对齐反复找位置。
-  for (let index = 0; index < 3; index += 1) {
-    const layout = await evaluate(page, readBillingProofLayoutExpression());
-    if (layout?.planInView && layout?.emailInView) return layout;
-    if (!layout?.wheelPoint) break;
-    const deltaY = layout.needUp && !layout.needDown ? -47 : 47;
-    await page.command('Input.dispatchMouseEvent', {
-      type: 'mouseWheel',
-      x: layout.wheelPoint.x,
-      y: layout.wheelPoint.y,
-      deltaX: 0,
-      deltaY,
-    });
-    await sleep(250);
-  }
-  return evaluate(page, readBillingProofLayoutExpression());
+  onStep('Billing 已打开，固定向下滚动一次后截图');
+  const viewport = await evaluate(page, '({ width: innerWidth, height: innerHeight })');
+  // 截图前固定向下滚动一次，不再根据套餐或邮箱位置重复滚动。
+  await page.command('Input.dispatchMouseEvent', {
+    type: 'mouseWheel',
+    x: Math.max(1, viewport.width / 2),
+    y: Math.max(1, viewport.height / 2),
+    deltaX: 0,
+    deltaY: 47,
+  });
+  await sleep(250);
 }
 
 async function saveViewportScreenshot(page, fileName) {
