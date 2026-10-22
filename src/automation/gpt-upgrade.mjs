@@ -1,9 +1,10 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startAdsPowerProfile, stopAdsPowerProfile } from './adspower.mjs';
+import { startGoogleIncognitoBrowser, stopGoogleIncognitoBrowser } from './google-incognito.mjs';
 import { screenshotDirectory } from '../temp-screenshots.mjs';
 
-export const PRODUCTS = ['Maximum power'];
+export const PRODUCTS = ['Pro'];
 
 const MULTIPLIERS = ['20x', '5x'];
 const DOM_POLL_MILLISECONDS = 250;
@@ -268,15 +269,15 @@ async function readHomeUpgradeEntry(client) {
 }
 
 async function readAllPlansState(client) {
-  const card = await readMaximumPowerCard(client);
+  const card = await readProCard(client);
   return card || false;
 }
 
-async function readMaximumPowerCard(client) {
+async function readProCard(client) {
   return evaluate(client, `(() => {
     const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const marker = [...document.querySelectorAll('body *')]
-      .find((node) => normalize(node.innerText || node.textContent) === 'Maximum power');
+      .find((node) => /^(ChatGPT Pro|Maximum power)$/i.test(normalize(node.innerText || node.textContent)));
     if (!marker) return null;
     let card = marker;
     for (let depth = 0; card && depth < 10; depth += 1, card = card.parentElement) {
@@ -287,7 +288,7 @@ async function readMaximumPowerCard(client) {
       if (rect.width <= 0 || rect.height <= 0) continue;
       return {
         title: 'ChatGPT Pro',
-        description: 'Maximum power',
+        description: 'Pro',
         button: 'Upgrade to Pro',
         point: {
           x: rect.left + rect.width / 2,
@@ -302,13 +303,13 @@ async function readMaximumPowerCard(client) {
   })()`);
 }
 
-async function clickMaximumPowerCard(client, onPlans) {
-  // See all plans 点击后最多等待 5 秒；在 5 秒内发现 Maximum power 即立即继续。
+async function clickProCard(client, onPlans) {
+  // See all plans 点击后最多等待 5 秒；在 5 秒内发现 Pro 卡片即立即继续。
   const card = await waitForValue(
-    () => readMaximumPowerCard(client),
+    () => readProCard(client),
     Boolean,
     5000,
-    '点击 See all plans 后等待 5 秒，仍未找到 ChatGPT Pro / Maximum power / Upgrade to Pro',
+    '点击 See all plans 后等待 5 秒，仍未找到 ChatGPT Pro / Upgrade to Pro',
   );
   onPlans([{ title: card.title, description: card.description, button: card.button }]);
   let visibleCard = card;
@@ -327,16 +328,16 @@ async function clickMaximumPowerCard(client, onPlans) {
       });
     }
     await sleep(300);
-    visibleCard = await readMaximumPowerCard(client);
+    visibleCard = await readProCard(client);
   }
   if (!visibleCard?.point || visibleCard.point.y < 0 || visibleCard.point.y > visibleCard.viewport.height) {
-    throw new Error('已识别 Maximum power，但 Upgrade to Pro 未滚动到可视区域');
+    throw new Error('已识别 Pro，但 Upgrade to Pro 未滚动到可视区域');
   }
   // 套餐列表展开后仍会继续排版；按钮稳定一秒后重新读取坐标，避免点击落在旧位置。
   await sleep(1000);
-  visibleCard = await readMaximumPowerCard(client);
+  visibleCard = await readProCard(client);
   if (!visibleCard?.point || visibleCard.point.y < 0 || visibleCard.point.y > visibleCard.viewport.height) {
-    throw new Error('Maximum power 已识别，但 Upgrade to Pro 在点击前离开了可视区域');
+    throw new Error('Pro 已识别，但 Upgrade to Pro 在点击前离开了可视区域');
   }
   await mouseClick(client, visibleCard.point);
 
@@ -348,7 +349,7 @@ async function clickMaximumPowerCard(client, onPlans) {
     await waitForValue(readTransition, Boolean, 12000, 'Upgrade to Pro 已点击，但页面没有进入购买流程');
   } catch (firstError) {
     // React 水合阶段可能吞掉第一次鼠标事件；只重新定位并补点当前 Upgrade to Pro 一次。
-    const retryCard = await readMaximumPowerCard(client);
+    const retryCard = await readProCard(client);
     if (!retryCard?.point || retryCard.point.y < 0 || retryCard.point.y > retryCard.viewport.height) throw firstError;
     await mouseClick(client, retryCard.point);
     try {
@@ -1048,12 +1049,27 @@ async function readSubscribeOutcome(page) {
       return rect.width > 0 && rect.height > 0;
     };
     const body = normalize(document.body?.innerText || '');
-    const alertTexts = [...document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]')]
-      .filter(visible)
+    const alertNodes = [...document.querySelectorAll(
+      '[role="alert"], [aria-live="assertive"], [aria-live="polite"], [data-sonner-toast], [data-testid*="alert" i], [class*="alert" i], [class*="error" i]',
+    )].filter(visible);
+    const alertTexts = alertNodes
       .map((node) => normalize(node.innerText || node.textContent))
       .filter(Boolean);
+    // 结账页左上角的任何可见提示都视为本次支付失败，不能只依赖固定英文文案。
+    const topLeftPrompt = alertNodes
+      .map((node) => ({ node, text: normalize(node.innerText || node.textContent) }))
+      .filter(({ node, text }) => {
+        const rect = node.getBoundingClientRect();
+        return Boolean(text)
+          && rect.top >= 0
+          && rect.top <= innerHeight * 0.4
+          && rect.left >= 0
+          && rect.left <= innerWidth * 0.6;
+      })
+      .sort((left, right) => left.node.getBoundingClientRect().top - right.node.getBoundingClientRect().top)[0]?.text || '';
     const declinedFromBody = (body.match(/Your payment was declined\\.[^.]{0,80}\\./i) || body.match(/Your payment was declined\\. Try a different card\\./i) || [])[0] || '';
-    const error = alertTexts.find((text) => /declined|try a different card|payment failed|couldn['’]t (be )?process|card was declined/i.test(text))
+    const error = topLeftPrompt
+      || alertTexts.find((text) => /declined|try a different card|payment failed|couldn['’]t (be )?process|card was declined/i.test(text))
       || (body.includes('Your payment was declined') ? (declinedFromBody || 'Your payment was declined. Try a different card.') : '');
     const leftCheckout = !/\\/checkout\\//i.test(location.href);
     const successText = /you('re| are) all set|welcome to chatgpt pro|subscription (is )?now active|thanks for subscribing/i.test(body);
@@ -1272,14 +1288,17 @@ async function readSettingsMenuState(page) {
       return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
     };
     return [...document.querySelectorAll('button,a,[role="button"],[role="menuitem"]')]
-      .some((node) => !node.disabled && visible(node) && normalize(node.innerText || node.textContent || node.getAttribute('aria-label')) === 'Settings');
+      .some((node) => !node.disabled && visible(node) && /^(Settings|设置)$/i.test(normalize(node.innerText || node.textContent || node.getAttribute('aria-label'))));
   })()`);
 }
 
-async function readSettingsDialogState(page) {
+async function readSettingsPageState(page) {
   return evaluate(page, `(() => {
+    const path = location.pathname || '';
     const bodyText = document.body?.innerText || '';
-    return bodyText.includes('General') && bodyText.includes('Billing') && (bodyText.includes('Search settings') || bodyText.includes('Appearance'));
+    // 当前 Settings 会跳转到独立页面，不再等待旧版弹窗结构。
+    return /^\/settings(?:\/|$)/i.test(path)
+      && (/Settings|General|Billing|账单|设置/i.test(bodyText));
   })()`);
 }
 
@@ -1289,21 +1308,6 @@ async function readBillingPanelState(page) {
     return bodyText.includes('Billing email')
       || /ChatGPT (Pro|Plus|Team|Business|Go)|Your plan auto-renews|Change plan/i.test(bodyText);
   })()`);
-}
-
-
-async function scrollBillingProofIntoView(page, onStep = () => {}) {
-  onStep('Billing 已打开，固定向下滚动一次后截图');
-  const viewport = await evaluate(page, '({ width: innerWidth, height: innerHeight })');
-  // 截图前固定向下滚动一次，不再根据套餐或邮箱位置重复滚动。
-  await page.command('Input.dispatchMouseEvent', {
-    type: 'mouseWheel',
-    x: Math.max(1, viewport.width / 2),
-    y: Math.max(1, viewport.height / 2),
-    deltaX: 0,
-    deltaY: 47,
-  });
-  await sleep(250);
 }
 
 async function saveViewportScreenshot(page, fileName) {
@@ -1377,13 +1381,14 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       homePage,
       'Settings',
       {
+        alternateTexts: ['设置'],
         timeoutMilliseconds: 10000,
         timeoutMessage: '头像菜单里没有找到可点击的 Settings',
         stabilityMilliseconds: 600,
       },
-      () => readSettingsDialogState(homePage),
+      () => readSettingsPageState(homePage),
       10000,
-      'Settings 已点击，但设置弹窗没有打开',
+      'Settings 已点击，但设置页面没有打开',
     );
 
     onStep('点击 Billing');
@@ -1391,6 +1396,7 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       homePage,
       'Billing',
       {
+        alternateTexts: ['账单'],
         region: 'left',
         timeoutMilliseconds: 10000,
         timeoutMessage: '设置弹窗里没有找到可点击的 Billing',
@@ -1401,9 +1407,7 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       'Billing 已点击，但账单内容没有出现',
     );
 
-    await scrollBillingProofIntoView(homePage, onStep);
-
-    onStep('截取套餐和邮箱');
+    onStep('Billing 已打开，截取当前完整页面');
     await sleep(600);
     const fileName = `${jobId || 'job'}-${Number(index) || 0}.png`;
     const screenshotUrl = await saveViewportScreenshot(homePage, fileName);
@@ -1417,7 +1421,129 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
   }
 }
 
-async function fillLoginIfNeeded(page, row, onStatus) {
+async function readLoginVerificationState(page) {
+  return evaluate(page, `(() => {
+    const visible = (node) => {
+      if (!node) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
+    };
+    const codeInput = [...document.querySelectorAll('input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name="code"]')].find(visible);
+    const body = document.body?.innerText || '';
+    return {hasCodeInput: Boolean(codeInput), mentionsCode: /verification code|login code|验证码|验证码已发送/i.test(body)};
+  })()`);
+}
+
+async function readLatestChatGptCode(page) {
+  return evaluate(page, `(() => {
+    const body = String(document.body?.innerText || '').replace(/\\s+/g, ' ');
+    const match = body.match(/(?:enter this code|your code is|验证码)[^0-9]{0,50}(\\d{6})/i);
+    return match?.[1] || '';
+  })()`);
+}
+
+function inferMailType(email) {
+  const domain = String(email || '').trim().toLowerCase().split('@').pop() || '';
+  if (/^(outlook|hotmail|live|msn)\./.test(domain)) return 'outlook';
+  if (/^(gmail|googlemail)\./.test(domain)) return 'gmail';
+  throw new Error(`无法根据邮箱域名识别 mail2 类型：${domain || '空邮箱域名'}`);
+}
+
+async function chooseMailTypeByDomain(page, email) {
+  const kind = inferMailType(email);
+  const state = await evaluate(page, `(() => {
+    const select = document.querySelector('select');
+    if (!select) return null;
+    select.scrollIntoView?.({block:'center', inline:'center'});
+    select.focus();
+    const options = [...select.options].map((option, index) => ({index, text: option.textContent || '', value: option.value || ''}));
+    const pattern = ${kind === 'outlook' ? '/outlook|microsoft/i' : '/gmail|google/i'};
+    const match = options.find((option) => pattern.test(option.text) || pattern.test(option.value));
+    return {active: document.activeElement === select, match, options};
+  })()`);
+  if (!state?.active || !state.match) throw new Error(`mail2 没有找到与邮箱域名匹配的类型：${kind}`);
+  await dispatchKey(page, 'Home', 'Home', 36);
+  for (let index = 0; index < state.match.index; index += 1) await dispatchKey(page, 'ArrowDown', 'ArrowDown', 40);
+  await dispatchKey(page, 'Enter', 'Enter', 13);
+  await dispatchKey(page, 'Tab', 'Tab', 9);
+  await sleep(300);
+  const selected = await evaluate(page, `(() => {
+    const select = document.querySelector('select');
+    return select?.selectedOptions?.[0]?.textContent || '';
+  })()`);
+  if (!String(selected).trim()) throw new Error('mail2 邮箱类型选择失败');
+}
+
+async function readMailCode(row, debugPort) {
+  const version = await fetch(`http://127.0.0.1:${debugPort}/json/version`).then((response) => response.ok ? response.json() : null).catch(() => null);
+  const targetResult = version?.webSocketDebuggerUrl ? await connectCdp(version.webSocketDebuggerUrl).catch(() => null) : null;
+  if (!targetResult) throw new Error('无法连接谷歌无痕浏览器以读取邮箱验证码');
+  let mailPage;
+  try {
+    const created = await targetResult.command('Target.createTarget', {url: 'https://mail2.ap1x.xyz/'});
+    const deadline = Date.now() + 30000;
+    while (Date.now() <= deadline) {
+      const targets = await getTargets(debugPort).catch(() => []);
+      const target = targets.find((item) => item.id === created.targetId && item.webSocketDebuggerUrl);
+      if (target) { mailPage = await connectCdp(target.webSocketDebuggerUrl); break; }
+      await sleep(250);
+    }
+    if (!mailPage) throw new Error('mail2 邮箱页面未打开');
+    await mailPage.command('Page.enable');
+    await mailPage.command('Runtime.enable');
+    await waitForValue(
+      () => evaluate(mailPage, `Boolean(document.querySelector('select')) && Boolean(document.querySelector('textarea, input[type="text"], input:not([type])'))`),
+      Boolean,
+      30000,
+      'mail2 页面输入框未加载完成',
+    );
+    await chooseSelectWithKeyboard(mailPage, 'select', row.mailType, [row.mailType], '邮箱类型');
+    await focusAndType(mailPage, 'textarea, input[type="text"], input:not([type])', row.mailAccess, {
+      label: 'mail2 邮箱查询字符串',
+      validateAfterInput: false,
+      intervalMilliseconds: 10,
+    });
+    await clickExactText(mailPage, '进入邮件列表', {
+      alternateTexts: ['Enter mail list'],
+      timeoutMilliseconds: 15000,
+      stabilityMilliseconds: 300,
+    });
+    return await waitForValue(
+      () => readLatestChatGptCode(mailPage),
+      (value) => /^\d{6}$/.test(String(value || '')),
+      30000,
+      'mail2 最近的 ChatGPT 邮件中没有六位验证码',
+    );
+  } finally {
+    try { if (mailPage) mailPage.close(); } catch {}
+    targetResult.close();
+  }
+}
+
+async function completeEmailVerification(page, row, debugPort, onStatus) {
+  const state = await readLoginVerificationState(page);
+  if (!state?.hasCodeInput && !state?.mentionsCode) return;
+  onStatus('ChatGPT 需要邮箱验证码，正在通过 mail2 读取最近邮件');
+  const code = await readMailCode(row, debugPort);
+  await focusAndType(page, 'input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name="code"], input[type="text"]', code, {
+    label: 'ChatGPT 邮箱验证码',
+    normalize: (value) => String(value || '').replace(/\D/g, ''),
+  });
+  await clickExactText(page, 'Continue', {
+    alternateTexts: ['Verify', '验证'],
+    timeoutMilliseconds: 10000,
+    stabilityMilliseconds: 300,
+  }).catch(() => {});
+  await waitForValue(
+    () => evaluate(page, `(() => !document.querySelector('input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name="code"]'))()`),
+    Boolean,
+    10000,
+    'ChatGPT 验证码已输入，但登录页面没有继续',
+  ).catch(() => {});
+  onStatus('邮箱验证码已输入，已继续 ChatGPT 登录');
+}
+
+async function fillLoginIfNeeded(page, row, onStatus, rechargeType, debugPort) {
   const entryState = await waitForValue(
     () => evaluate(page, `(() => {
       const visible = (node) => { if (!node) return false; const rect = node.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; };
@@ -1442,15 +1568,21 @@ async function fillLoginIfNeeded(page, row, onStatus) {
 
   await focusAndType(page, 'input[type="email"], input[name="email"]', row.email, { label: 'ChatGPT 登录邮箱' });
   await clickExactText(page, 'Continue', { timeoutMilliseconds: 20000, timeoutMessage: '没有找到登录邮箱后的 Continue' });
-  await waitForValue(
-    () => evaluate(page, `Boolean(document.querySelector('input[type="password"], input[name="password"]'))`),
-    Boolean,
+  const nextStep = await waitForValue(
+    () => evaluate(page, `(() => ({
+      hasPassword: Boolean(document.querySelector('input[type="password"], input[name="password"]')),
+      verification: Boolean(document.querySelector('input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name="code"]')),
+    }))()`),
+    (state) => state?.hasPassword || state?.verification,
     20000,
-    '等待 ChatGPT 密码输入框超时',
+    '等待 ChatGPT 密码或邮箱验证码输入框超时',
   );
-  await focusAndType(page, 'input[type="password"], input[name="password"]', row.password, { label: 'ChatGPT 登录密码' });
-  await clickExactText(page, 'Continue', { timeoutMilliseconds: 20000, timeoutMessage: '没有找到登录密码后的 Continue' });
-  onStatus('已用键盘输入账号密码；若出现邮箱验证码或 MFA，请在 AdsPower 中人工完成');
+  if (nextStep.hasPassword) {
+    await focusAndType(page, 'input[type="password"], input[name="password"]', row.password, { label: 'ChatGPT 登录密码' });
+    await clickExactText(page, 'Continue', { timeoutMilliseconds: 20000, timeoutMessage: '没有找到登录密码后的 Continue' });
+    onStatus('已用键盘输入账号密码，等待 ChatGPT 登录结果');
+  }
+  if (rechargeType === 'google-incognito') await completeEmailVerification(page, row, debugPort, onStatus);
 }
 
 async function openChatGptAndPreparePayment(profile, row, product, multiplier, onStatus, onPlans, onStep, proofContext = {}) {
@@ -1497,7 +1629,7 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
     );
 
     onStep('处理 ChatGPT 登录');
-    await fillLoginIfNeeded(page, row, onStatus);
+    await fillLoginIfNeeded(page, row, onStatus, proofContext.rechargeType || 'ads', profile.debugPort);
 
     onStep('等待 ChatGPT 首页完全加载并稳定');
     await sleep(1200);
@@ -1541,14 +1673,14 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
       },
       () => readAllPlansState(page),
       5000,
-      'See all plans 已点击，但等待 5 秒仍未显示 Maximum power',
+      'See all plans 已点击，但等待 5 秒仍未显示 Pro',
     );
     onStep('See all plans 已点击，完整套餐列表已加载');
 
-    onStep('等待并识别 Maximum power（最多 5 秒）');
-    if (product !== 'Maximum power') throw new Error(`当前流程不支持产品：${product}`);
-    onStep('Maximum power 已识别，点击 Upgrade to Pro');
-    await clickMaximumPowerCard(page, onPlans);
+    onStep('等待并识别 Pro（最多 5 秒）');
+    if (product !== 'Pro') throw new Error(`当前流程不支持产品：${product}`);
+    onStep('Pro 已识别，点击 Upgrade to Pro');
+    await clickProCard(page, onPlans);
     onStep('Upgrade to Pro 已点击，正在进入购买页面');
 
     onStep('等待 ChatGPT Pro 支付页');
@@ -1607,10 +1739,12 @@ async function runWithConcurrency(rows, concurrency, worker, shouldStop = () => 
   return results;
 }
 
-function validatePaymentRow(row) {
+function validatePaymentRow(row, rechargeType) {
   const requiredFields = ['adsPowerSerialNumber', 'email', 'password', 'cardNumber', 'expires_at', 'cvv'];
+  if (rechargeType === 'google-incognito') requiredFields.splice(0, 1);
   const missingFields = requiredFields.filter((field) => !String(row[field] || '').trim());
   if (missingFields.length) throw new Error(`当前任务缺少字段：${missingFields.join('、')}`);
+  if (rechargeType === 'google-incognito' && !String(row.mailAccess || '').trim()) throw new Error('当前任务缺少 mailAccess');
   if (!/^(US|USA|United States)?$/i.test(String(row.billingCountry || 'US').trim())) {
     throw new Error('当前流程的 billingCountry 只允许 US / United States');
   }
@@ -1620,8 +1754,9 @@ export async function runUpgradeJob({
   jobId,
   rows,
   concurrency = 1,
-  product = 'Maximum power',
+  product = 'Pro',
   multiplier = '20x',
+  rechargeType = 'ads',
   apiBase,
   apiKey,
   onEvent = () => {},
@@ -1629,17 +1764,20 @@ export async function runUpgradeJob({
 }) {
   if (!PRODUCTS.includes(product)) throw new Error(`不支持的 GPT 产品：${product}`);
   if (!MULTIPLIERS.includes(multiplier)) throw new Error(`不支持的倍率：${multiplier}`);
+  if (!['ads', 'google-incognito'].includes(rechargeType)) throw new Error(`不支持的充值类型：${rechargeType}`);
 
   const boundedConcurrency = Math.max(1, Math.min(10, Number(concurrency) || 1));
   const results = await runWithConcurrency(rows, boundedConcurrency, async (row, index) => {
     const serialNumber = String(row.adsPowerSerialNumber || '').trim();
     const uiIndex = Number.isInteger(row.__uiIndex) ? row.__uiIndex : index;
-    const prefix = `第 ${uiIndex + 1} 条 / AdsPower ${serialNumber}`;
+    const prefix = `第 ${uiIndex + 1} 条 / ${rechargeType === 'google-incognito' ? '谷歌无痕模式' : `AdsPower ${serialNumber}`}`;
     let profile;
     let currentStep = '任务校验';
     let active = true;
     let timeoutId;
-    const stopBrowser = () => stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
+    const stopBrowser = () => rechargeType === 'google-incognito'
+      ? stopGoogleIncognitoBrowser(profile)
+      : stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
     const emit = (payload) => {
       if (!active) return;
       onEvent(payload);
@@ -1647,12 +1785,14 @@ export async function runUpgradeJob({
 
     const runRow = async () => {
       // 卡、账号和账单地址始终来自同一任务行，禁止跨行借用。
-      validatePaymentRow(row);
-      currentStep = '启动 AdsPower';
-      emit({ type: 'row_started', index: uiIndex, message: `${prefix}：启动 AdsPower` });
-      profile = await startAdsPowerProfile({ serialNumber, apiBase, apiKey });
+      validatePaymentRow(row, rechargeType);
+      currentStep = rechargeType === 'google-incognito' ? '启动谷歌无痕浏览器' : '启动 AdsPower';
+      emit({ type: 'row_started', index: uiIndex, message: `${prefix}：${currentStep}` });
+      profile = rechargeType === 'google-incognito'
+        ? await startGoogleIncognitoBrowser()
+        : await startAdsPowerProfile({ serialNumber, apiBase, apiKey });
       if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
-      emit({ type: 'browser_started', index: uiIndex, message: `${prefix}：已打开 AdsPower，进入 chatgpt.com` });
+      emit({ type: 'browser_started', index: uiIndex, message: `${prefix}：已打开${rechargeType === 'google-incognito' ? '谷歌无痕浏览器' : 'AdsPower'}，进入 chatgpt.com` });
 
       const proof = await openChatGptAndPreparePayment(profile, row, product, multiplier, (message) => {
         emit({ type: 'login_verification_required', index: uiIndex, message: `${prefix}：${message}` });
@@ -1660,7 +1800,7 @@ export async function runUpgradeJob({
         if (!active) return;
         currentStep = step;
         emit({ type: 'step_started', index: uiIndex, message: `${prefix}：${step}` });
-      }, { jobId, index: uiIndex });
+      }, { jobId, index: uiIndex, rechargeType });
       if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
       return proof || {};
     };
@@ -1693,7 +1833,7 @@ export async function runUpgradeJob({
     } catch (error) {
       clearTimeout(timeoutId);
       const timedOut = !active || String(error.message || '').includes(ROW_TIMEOUT_MESSAGE);
-      const afterPayment = /Subscribe 已提交|第一次点击|补点|支付处理中|支付成功|充值完成|左下角头像|点击 Settings|点击 Billing|稍微滑动|截取套餐和邮箱|Billing 截图/.test(currentStep);
+      const afterPayment = /Subscribe 已提交|第一次点击|补点|支付处理中|支付成功|充值完成|左下角头像|点击 Settings|点击 Billing|Billing 已打开|Billing 截图/.test(currentStep);
       if (afterPayment) {
         // Subscribe 已经成功；截图阶段超时或失败不能打进失败重试，避免重复扣款。
         const screenshotError = timedOut ? ROW_TIMEOUT_MESSAGE : error.message;
@@ -1727,7 +1867,7 @@ export async function runUpgradeJob({
     const row = rows[index];
     const serialNumber = String(row.adsPowerSerialNumber || '').trim();
     const uiIndex = Number.isInteger(row.__uiIndex) ? row.__uiIndex : index;
-    const prefix = `第 ${uiIndex + 1} 条 / AdsPower ${serialNumber}`;
+    const prefix = `第 ${uiIndex + 1} 条 / ${rechargeType === 'google-incognito' ? '谷歌无痕模式' : `AdsPower ${serialNumber}`}`;
     results[index] = { index: uiIndex, serialNumber, status: 'cancelled' };
     onEvent({ type: 'row_cancelled', index: uiIndex, message: `${prefix}：排队任务已终止，未开始执行` });
   }

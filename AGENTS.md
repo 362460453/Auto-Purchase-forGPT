@@ -8,11 +8,11 @@
 
 当前业务边界：
 
-- 只支持个人版 `Maximum power`，页面实际按钮文案是 `Upgrade to Pro`。
+- 只支持个人版 `Pro`；套餐卡可能显示 `Maximum power`，页面实际按钮文案是 `Upgrade to Pro`。
 - 只支持 `20x` 和 `5x`，默认 `20x`；对应页面 `Due today` 应分别为 `$200.00` 和 `$100.00`。
 - 自动化填写账号、银行卡和 Billing 地址后，点击 `Subscribe`。
 - 若页面出现 `Your payment was declined. Try a different card.` 等拒付或支付异常，只结束当前任务并写入失败原因；其他并发任务继续执行。
-- 不实现团队版，不把其他产品强行套用到 Maximum power 的流程。
+- 不实现团队版，不把其他产品强行套用到 Pro 的流程。
 - 登录出现邮箱验证码、MFA、CAPTCHA 或风控时，只提示用户在 AdsPower 窗口中人工完成，不绕过验证。
 
 ## 2. 技术结构（用 Java 分层类比）
@@ -102,7 +102,7 @@ Billing 地址规则：
 
 - `rows`：已绑定 Billing 地址的任务行。
 - `concurrency`：1-10，服务层再次限制边界。
-- `product`：当前只能是 `Maximum power`。
+- `product`：当前只能是 `Pro`。
 - `multiplier`：`20x` 或 `5x`。
 - `apiBase`、`apiKey`：AdsPower 设置。
 

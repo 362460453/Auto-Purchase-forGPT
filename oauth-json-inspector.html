@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JSON 字段查看器</title>
+    <style>
+      :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; }
+      body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 48px; }
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      .tip { color: #9ca3af; line-height: 1.6; margin: 0 0 22px; }
+      .panel { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 18px; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+      .drop-zone { margin-bottom: 14px; border: 2px dashed #4b5563; border-radius: 10px; padding: 20px; text-align: center; color: #9ca3af; transition: border-color .15s, background .15s, color .15s; }
+      .drop-zone.dragging { border-color: #60a5fa; background: #172554; color: #dbeafe; }
+      input[type="file"] { max-width: 100%; }
+      button { border: 0; border-radius: 8px; padding: 9px 12px; background: #2563eb; color: #fff; cursor: pointer; font: inherit; }
+      button:disabled { background: #4b5563; cursor: not-allowed; }
+      button.secondary { background: #374151; }
+      .copy-notice { min-height: 20px; color: #86efac; font-size: 14px; }
+      #status { min-height: 22px; margin: 14px 0 0; color: #93c5fd; }
+      .table-wrap { overflow: auto; margin-top: 18px; border: 1px solid #374151; border-radius: 10px; }
+      table { width: 100%; border-collapse: collapse; min-width: 720px; }
+      th, td { text-align: left; padding: 12px; border-bottom: 1px solid #374151; vertical-align: top; }
+      th:first-child, td:first-child { width: 18%; min-width: 160px; }
+      th { background: #111827; color: #9ca3af; font-size: 13px; position: sticky; top: 0; }
+      tr:last-child td { border-bottom: 0; }
+      code { white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .copy { padding: 6px 9px; font-size: 13px; white-space: nowrap; }
+      .empty { color: #9ca3af; text-align: center; padding: 28px; }
+    </style>
+  </head>
+  <body>
+    <h1>本地 JSON 字段查看器</h1>
+    <p class="tip">文件只在当前浏览器中解析，不会上传。所有字段均按原文展示，支持单独复制或复制全部字段。</p>
+
+    <section class="panel">
+      <div id="dropZone" class="drop-zone" tabindex="0">把 JSON 文件拖到这里，或通过下方按钮选择文件</div>
+      <div class="toolbar">
+        <input id="fileInput" type="file" accept="application/json,.json" />
+        <button id="copyAllButton" type="button" disabled>复制全部字段</button>
+        <span id="copyNotice" class="copy-notice" role="status"></span>
+      </div>
+      <div id="status" role="status">请选择一个 JSON 文件。</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>字段路径</th><th>类型</th><th>值</th><th>操作</th></tr></thead>
+          <tbody id="fieldRows"><tr><td class="empty" colspan="4">尚未读取文件</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <script>
+      const fileInput = document.querySelector('#fileInput');
+      const fieldRows = document.querySelector('#fieldRows');
+      const statusElement = document.querySelector('#status');
+      const copyAllButton = document.querySelector('#copyAllButton');
+      const dropZone = document.querySelector('#dropZone');
+      const copyNotice = document.querySelector('#copyNotice');
+      let fields = [];
+      let copyNoticeTimer;
+
+      // 将嵌套对象和数组展开，便于按“字段路径 -> 值”检查配置。
+      function flatten(value, path = '', result = []) {
+        if (value === null || typeof value !== 'object') {
+          result.push({ path: path || '（根值）', type: value === null ? 'null' : typeof value, value });
+          return result;
+        }
+        const entries = Array.isArray(value) ? value.entries() : Object.entries(value);
+        let hasEntry = false;
+        for (const [key, childValue] of entries) {
+          hasEntry = true;
+          const childPath = Array.isArray(value) ? `${path}[${key}]` : (path ? `${path}.${key}` : key);
+          flatten(childValue, childPath, result);
+        }
+        if (!hasEntry) result.push({ path: path || '（根对象）', type: Array.isArray(value) ? 'array' : 'object', value: Array.isArray(value) ? '[]' : '{}' });
+        return result;
+      }
+
+      async function copyText(text, message, copyButton) {
+        await navigator.clipboard.writeText(text);
+        statusElement.textContent = message;
+        copyNotice.textContent = '已复制';
+        clearTimeout(copyNoticeTimer);
+        copyNoticeTimer = setTimeout(() => { copyNotice.textContent = ''; }, 1800);
+        if (copyButton) {
+          const originalText = copyButton.textContent;
+          copyButton.textContent = '已复制';
+          copyButton.disabled = true;
+          setTimeout(() => {
+            copyButton.textContent = originalText;
+            copyButton.disabled = false;
+          }, 1200);
+        }
+      }
+
+      function render() {
+        fieldRows.replaceChildren();
+        for (const field of fields) {
+          const row = document.createElement('tr');
+          // 原值仅用于当前页面和用户主动复制；HTML 转义避免文件内容被当作代码执行。
+          const copyValue = String(field.value);
+          row.innerHTML = `<td><code>${escapeHtml(field.path)}</code></td><td>${escapeHtml(field.type)}</td><td><code>${escapeHtml(copyValue)}</code></td>`;
+          const actionCell = document.createElement('td');
+          const copyButton = document.createElement('button');
+          copyButton.className = 'copy secondary';
+          copyButton.textContent = '复制';
+          copyButton.addEventListener('click', () => copyText(copyValue, `已复制：${field.path}`, copyButton));
+          actionCell.append(copyButton);
+          row.append(actionCell);
+          fieldRows.append(row);
+        }
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
+      }
+
+      async function readJsonFile(file) {
+        if (!file) return;
+        try {
+          const parsed = JSON.parse(await file.text());
+          fields = flatten(parsed);
+          render();
+          copyAllButton.disabled = fields.length === 0;
+          statusElement.textContent = `已在本地解析 ${file.name}，共 ${fields.length} 个字段。`;
+        } catch (error) {
+          fields = [];
+          fieldRows.innerHTML = '<tr><td class="empty" colspan="4">文件不是有效 JSON。</td></tr>';
+          copyAllButton.disabled = true;
+          // 解析异常可能包含原始文件片段，避免将凭证内容带入错误提示。
+          statusElement.textContent = '解析失败：请检查文件是否为有效 JSON。';
+        }
+      }
+
+      fileInput.addEventListener('change', () => {
+        readJsonFile(fileInput.files[0]);
+      });
+
+      // 阻止浏览器把文件作为页面打开，确保拖拽只用于本地解析。
+      ['dragenter', 'dragover'].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          dropZone.classList.add('dragging');
+        });
+      });
+      ['dragleave', 'drop'].forEach((eventName) => {
+        dropZone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          dropZone.classList.remove('dragging');
+        });
+      });
+      dropZone.addEventListener('drop', (event) => {
+        const file = event.dataTransfer.files[0];
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.json')) {
+          statusElement.textContent = '请选择扩展名为 .json 的文件。';
+          return;
+        }
+        readJsonFile(file);
+      });
+
+      copyAllButton.addEventListener('click', () => {
+        const allFields = fields.map((field) => `${field.path} = ${field.value}`).join('\n');
+        copyText(allFields, '已复制全部字段。', copyAllButton);
+      });
+    </script>
+  </body>
+</html>

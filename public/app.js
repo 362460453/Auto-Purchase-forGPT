@@ -1,5 +1,9 @@
 const $ = (selector) => document.querySelector(selector);
-const requiredColumns = ['adsPowerSerialNumber', 'email', 'password', 'cardNumber', 'expires_at', 'cvv'];
+const csvColumns = {
+  ads: ['adsPowerSerialNumber', 'email', 'password', 'cardNumber', 'expires_at', 'cvv'],
+  'google-incognito': ['email', 'password', 'cardNumber', 'expires_at', 'cvv', 'mailAccess'],
+};
+let rechargeType = 'ads';
 let rows = [];
 const rowStates = [];
 let failedIndexes = [];
@@ -73,9 +77,10 @@ function parseCsv(text) {
   if (field || record.length) { record.push(field.trim()); if (record.some(Boolean)) records.push(record); }
   return records;
 }
-function csvRows(text) {
+function csvRows(text, type) {
   const records = parseCsv(text);
   const header = (records.shift() || []).map((value, index) => index === 0 ? value.replace(/^\uFEFF/, '') : value);
+  const requiredColumns = csvColumns[type] || csvColumns.ads;
   const missing = requiredColumns.filter((column) => !header.includes(column));
   if (missing.length) throw new Error(`CSV 缺少字段：${missing.join('、')}`);
   return records.map((values) => Object.fromEntries(header.map((key, index) => [key, values[index] || ''])));
@@ -152,12 +157,26 @@ $('#settings-form').addEventListener('submit', (event) => {
   $('#settings-dialog').close();
   $('#activity').textContent = 'AdsPower 设置已保存';
 });
-$('#csv-file').addEventListener('change', async (event) => { try { const importedRows = csvRows(await event.target.files[0].text()); if (!importedRows.length) throw new Error('CSV 没有账号记录'); if (importedRows.length > 100) throw new Error('单次最多支持 100 条记录'); rows = bindBillingAddresses(importedRows, $('#billing-state').value); rowStates.length = rows.length; rowStates.fill({}); failedIndexes = []; $('#file-name').textContent = `${event.target.files[0].name} · ${rows.length} 条 · ${$('#billing-state').selectedOptions[0].textContent}`; $('#validation').hidden = true; renderRows(); } catch (error) { rows = []; $('#validation').hidden = false; $('#validation').textContent = error.message; $('#start').disabled = true; } });
+$('#recharge-type').addEventListener('change', (event) => {
+  rechargeType = event.target.value;
+  rows = [];
+  rowStates.length = 0;
+  failedIndexes = [];
+  $('#csv-file').value = '';
+  $('#file-name').textContent = '尚未选择文件';
+  $('#validation').hidden = true;
+  $('#task-list').hidden = true;
+  $('#start').disabled = true;
+  $('#activity').textContent = rechargeType === 'ads' ? '当前为 AdsPower 充值' : '当前为谷歌无痕模式充值';
+});
+$('#csv-file').addEventListener('change', async (event) => { try { const importedRows = csvRows(await event.target.files[0].text(), rechargeType); if (!importedRows.length) throw new Error('CSV 没有账号记录'); if (importedRows.length > 100) throw new Error('单次最多支持 100 条记录'); rows = bindBillingAddresses(importedRows, $('#billing-state').value); rowStates.length = rows.length; rowStates.fill({}); failedIndexes = []; $('#file-name').textContent = `${event.target.files[0].name} · ${rows.length} 条 · ${rechargeType === 'ads' ? 'AdsPower' : '谷歌无痕模式'} · ${$('#billing-state').selectedOptions[0].textContent}`; $('#validation').hidden = true; renderRows(); } catch (error) { rows = []; $('#validation').hidden = false; $('#validation').textContent = error.message; $('#start').disabled = true; } });
 $('#download-template').addEventListener('click', (event) => {
   event.preventDefault();
-  // 导入模板保持原有六列，避免已有任务文件需要跟着修改。
-  const header = requiredColumns.join(',');
-  const example = '10001,name@example.com,填入邮箱密码,4111111111111111,0931,123';
+  const columns = csvColumns[rechargeType] || csvColumns.ads;
+  const header = columns.join(',');
+  const example = rechargeType === 'ads'
+    ? '10001,name@example.com,填入邮箱密码,4111111111111111,0931,123'
+    : 'name@example.com,填入邮箱密码,4111111111111111,0931,123,name@example.com----client_id----refresh_token';
   const blob = new Blob([`${header}\n${example}\n`], {type:'text/csv'});
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
@@ -249,7 +268,7 @@ document.addEventListener('click', (event) => {
   hideReasonZoom();
   hideScreenshotZoom();
 });
-async function startJob(taskRows) { jobRunning = true; stopRequested = false; renderRows(); $('#activity').textContent = '正在启动任务'; const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rows:taskRows, concurrency:Number($('#concurrency').value), product:$('#product').value, multiplier:document.querySelector('input[name="multiplier"]:checked').value, apiBase:settings.apiBase, apiKey:settings.apiKey})}); if (!response.ok) { const body = await response.json(); jobRunning = false; stopRequested = false; $('#validation').hidden = false; $('#validation').textContent = body.error || '任务启动失败'; renderRows(); } }
+async function startJob(taskRows) { jobRunning = true; stopRequested = false; renderRows(); $('#activity').textContent = '正在启动任务'; const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rows:taskRows, concurrency:Number($('#concurrency').value), product:$('#product').value, rechargeType, multiplier:document.querySelector('input[name="multiplier"]:checked').value, apiBase:settings.apiBase, apiKey:settings.apiKey})}); if (!response.ok) { const body = await response.json(); jobRunning = false; stopRequested = false; $('#validation').hidden = false; $('#validation').textContent = body.error || '任务启动失败'; renderRows(); } }
 $('#start').addEventListener('click', () => startJob(rows));
 $('#retry-failed').addEventListener('click', () => { const retryRows = failedIndexes.map((index) => ({...rows[index], __uiIndex:index})); if (retryRows.length) startJob(retryRows); });
 $('#stop-all').addEventListener('click', async () => {
