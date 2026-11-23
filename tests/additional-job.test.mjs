@@ -30,7 +30,7 @@ test('付款记录只接受明确支付成功，兼容旧日志且不限展示�
 test('四个附加入口不调用付款，不需卡资料，只返回本项；超时保留已取得 Key',async()=>{
   for(const option of ['screenshot','invoice','cpa','2fa']){
     const events=[];let stops=0,closes=0,delay;
-    const context=vm.createContext({AsyncLocalStorage, AbortController,initialPostPurchaseResult,interruptedPostPurchaseResult,
+    const context=vm.createContext({AsyncLocalStorage, AbortController,initialPostPurchaseResult,interruptedPostPurchaseResult,Date:{now:()=>1000},
       setTimeout:(fn,ms)=>{delay=ms;return setTimeout(fn,25);},clearTimeout,
       startAdsPowerProfile:async()=>({debugPort:1}),stopAdsPowerProfile:async()=>{stops++;}});
     vm.runInContext(source,context);
@@ -121,4 +121,19 @@ test('付款后头像晚于旧 60 秒仍继续，未出现只在整行上限记�
     }
     assert.ok(reads>0);
   }
+});
+
+test('Billing 账单已加载但邮箱未入镜时直接截图，不滚动或调整位置',async()=>{
+ const context=vm.createContext({AsyncLocalStorage,AbortController,setTimeout:fn=>fn()});vm.runInContext(source,context);
+ const commands=[],steps=[];let loaded=false;
+ const page={command:async(method,args)=>{commands.push({method,args});return{};}};
+ context.openAccountSettings=async()=>({page,extra:null});
+ context.readBillingPanelState=async()=>({ready:loaded,emailVisible:false,planVisible:true,wheel:{x:100,y:100}});
+ context.clickAndConfirm=async(_page,label,_options,confirm)=>{assert.equal(label,'Billing');assert.equal(await confirm(),false);loaded=true;assert.equal(await confirm(),true);};
+ context.saveViewportScreenshot=async()=>{assert.equal(loaded,true);await page.command('Page.captureScreenshot');return '/api/screenshots/fixture.png';};
+ const result=await context.captureAccountBillingProof(page,{jobId:'fixture',index:0,debugPort:1},step=>steps.push(step));
+ assert.equal(result.screenshotUrl,'/api/screenshots/fixture.png');
+ assert.equal(commands.filter(c=>c.method==='Page.captureScreenshot').length,1);
+ assert.equal(commands.some(c=>c.method==='Input.dispatchMouseEvent'&&c.args?.type==='mouseWheel'),false);
+ assert.ok(steps.includes('Billing 已加载，直接截图'));
 });

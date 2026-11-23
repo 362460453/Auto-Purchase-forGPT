@@ -1472,17 +1472,7 @@ function inspectBillingProof() {
   const labels = [...document.querySelectorAll('h1,h2,h3,p,span,div')];
   const email = labels.find(node => node.textContent?.trim() === 'Billing email');
   const plan = labels.find(node => /^ChatGPT (Pro|Plus|Team|Business|Go)(?: \d+)?$/.test(node.textContent?.trim() || ''));
-  let panel = email?.parentElement;
-  while (panel && !(panel.scrollHeight > panel.clientHeight && /auto|scroll/.test(getComputedStyle(panel).overflowY))) panel = panel.parentElement;
-  const rect = panel?.getBoundingClientRect() || {left:0,top:0,right:innerWidth,bottom:innerHeight};
-  const visible = node => {
-    if (!node) return false;
-    const r = node.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && r.top >= Math.max(0,rect.top) && r.bottom <= Math.min(innerHeight,rect.bottom);
-  };
-  return {ready:Boolean(email && plan) && !/Loading (settings|transactions)/i.test(text),
-    emailVisible:visible(email) && email.getBoundingClientRect().bottom + 28 < Math.min(innerHeight,rect.bottom),
-    planVisible:visible(plan), wheel:{x:Math.min(innerWidth - 20,(rect.left+rect.right)/2),y:Math.min(innerHeight-20,(rect.top+rect.bottom)/2)}};
+  return {ready:Boolean(email && plan) && !/Loading (settings|transactions)/i.test(text)};
 }
 
 async function readBillingPanelState(page) {
@@ -1602,14 +1592,8 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       'Billing 已点击，但账单内容没有出现',
     );
 
-    onStep('Billing 已加载，微调滚动后截图');
-    // 等待完整账单而非仅出现套餐标题；小幅滚动让邮箱入镜，无法同时容纳时仍保存截图，不重跑付款。
-    for (let attempt = 0; attempt < 12; attempt++) {
-      const state = await readBillingPanelState(homePage);
-      if (state.emailVisible) break;
-      await homePage.command('Input.dispatchMouseEvent', {type:'mouseWheel', ...state.wheel, deltaX:0, deltaY:100});
-      await sleep(250);
-    }
+    onStep('Billing 已加载，直接截图');
+    // 按用户要求保留账单当前视口，不滚动或调整邮箱位置；仅等待短暂布局稳定。
     await sleep(300);
     const fileName = `${jobId || 'job'}-${Number(index) || 0}.png`;
     const screenshotUrl = await saveViewportScreenshot(homePage, fileName);
