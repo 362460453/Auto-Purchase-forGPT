@@ -24,17 +24,18 @@
         <label>Billing 地址州<select id="billing-state"><option value="OR" selected>Oregon / 俄勒冈州</option></select></label>
       </div>
       <div id="file-name" class="file-name" role="status">尚未选择文件</div>
-      <fieldset id="additional-options" class="additional-options"><legend>附加选项（可多选）</legend>
+      <fieldset id="additional-options" class="additional-options"><legend>执行选项（可多选）</legend>
+        <label><input id="purchase-option" type="checkbox" checked> 充值</label>
         <label><input type="checkbox" name="additionalOptions" value="screenshot" checked> 截图</label>
         <label><input type="checkbox" name="additionalOptions" value="invoice"> 下载发票</label>
         <label><input type="checkbox" name="additionalOptions" value="cpa"> 导出 CPA</label>
         <label><input type="checkbox" name="additionalOptions" value="2fa"> 启用并导出 2FA</label>
-        <p>不勾选则付款成功后直接完成。</p>
+        <p>勾选充值可搭配任意附加功能；取消充值则仅执行所选附加功能。</p>
       </fieldset>
       <div id="discovered-plans" class="discovered-plans" hidden></div>
       <div id="validation" class="validation" hidden></div>
       <div id="task-list" class="task-list" hidden><div class="list-head"><h2>已导入任务</h2><div class="export-actions"><span id="task-count"></span><button id="export-results" class="secondary" type="button" disabled>导出 CSV</button></div></div><div id="task-table-wrap" class="table-wrap"><table><thead><tr><th>AdsPower 编号</th><th>邮箱</th><th id="password-heading" hidden>密码</th><th>银行卡</th><th>有效期</th><th>CVV</th><th>Billing 地址</th><th>状态</th><th>2FA 状态</th><th>CPA 状态</th><th>发票状态</th><th>失败原因</th><th>操作</th><th>复制</th><th>截图</th></tr></thead><tbody id="task-body"></tbody></table></div></div>
-      <div class="main-actions"><button id="start" disabled>启动 GPT 升级流程 <span>↗</span></button><button id="retry-failed" class="secondary-action" disabled>重试</button><button id="stop-all" class="secondary-action" type="button" title="只停止未开始的排队任务；正在执行的行可点终止本行" disabled>停止排队</button></div>
+      <div class="main-actions"><button id="start" disabled>启动所选任务 <span>↗</span></button><button id="retry-failed" class="secondary-action" disabled>重试</button><button id="stop-all" class="secondary-action" type="button" title="只停止未开始的排队任务；正在执行的行可点终止本行" disabled>停止排队</button></div>
       <section class="activity"><h2>执行状态</h2><div id="activity">等待导入文件</div><ul id="events"></ul></section>
     </section>
     <footer>AdsPower 模式使用五列 CSV，不读取密码；谷歌无痕模式保留密码及 mailAccess · Billing 地址按所选州生成 · 拒付只结束当前任务</footer>

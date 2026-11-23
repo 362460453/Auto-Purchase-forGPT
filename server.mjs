@@ -2,7 +2,7 @@ import http from 'node:http';
 import {appendFile, mkdir, readFile, readdir} from 'node:fs/promises';
 import {extname, isAbsolute, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {runUpgradeJob, runAdditionalJob} from './src/automation/gpt-upgrade.mjs';
+import {runUpgradeJob, runAdditionalJob, runAdditionalBatch} from './src/automation/gpt-upgrade.mjs';
 import {resolveProSelection} from './src/automation/pro-plans.mjs';
 import {resolveAdditionalOptions} from './src/automation/post-purchase.mjs';
 import {createPaidProfiles} from './src/paid-profiles.mjs';
@@ -144,6 +144,9 @@ async function handleRequest(request, response) {
     try {
       const input = await parseBody(request);
       const additional = request.url.endsWith('/additional');
+      if(input.purchase!==undefined&&typeof input.purchase!=='boolean')throw new Error('充值选项必须是布尔值');
+      const purchase=!additional&&input.purchase!==false;
+      if(!purchase&&input.rechargeType&&input.rechargeType!=='ads')throw new Error('仅 AdsPower 支持独立附加任务');
       const taskRows = additional ? [input.row] : input.rows;
       if (!Array.isArray(taskRows) || !taskRows.length || taskRows.some(row => !row || typeof row !== 'object')) throw new Error('请先导入 CSV');
       if (taskRows.length > 100) throw new Error('单次最多支持 100 条记录');
@@ -153,23 +156,28 @@ async function handleRequest(request, response) {
       }
       if (additional) {
         if (!['screenshot', 'invoice', 'cpa', '2fa'].includes(input.option)) throw new Error('请选择一个附加功能');
-        if (!paidProfiles.has(input.row.adsPowerSerialNumber)) throw new Error('没有该 Profile 的付款成功记录，不能补做附加功能');
         if (!Number.isInteger(input.row.__uiIndex) || input.row.__uiIndex < 0 || input.row.__uiIndex >= 100) throw new Error('任务行号无效');
       } else {
         const indexes = taskRows.map((row, index) => row.__uiIndex ?? index);
         if (indexes.some(index => !Number.isInteger(index) || index < 0 || index >= 100) || new Set(indexes).size !== indexes.length) {
           throw new Error('任务行号无效或重复');
         }
-        resolveProSelection(input);
+        if(purchase)resolveProSelection(input);
         input.additionalOptions = resolveAdditionalOptions(input.additionalOptions, input.rechargeType);
       }
-      const serials = additional || input.rechargeType !== 'google-incognito'
+      if(!purchase){
+        const options=additional?[input.option]:input.additionalOptions;
+        if(!options.length)throw new Error('请至少选择充值或一个附加功能');
+        if(options.includes('cpa')&&taskRows.some(row=>!row.email))throw new Error('CPA 需要当前行邮箱');
+        if(!additional)input.rows=taskRows.map((row,index)=>({adsPowerSerialNumber:row.adsPowerSerialNumber,email:row.email,__uiIndex:row.__uiIndex??index}));
+      }
+      const serials = !purchase || input.rechargeType !== 'google-incognito'
         ? taskRows.map(row => String(row.adsPowerSerialNumber || '').trim()) : [];
       if (serials.some(serial => !serial)) throw new Error('AdsPower 编号不能为空');
       if (new Set(serials).size !== serials.length) throw new Error('同一批次不能重复使用同一个 Profile');
       if (serials.some(serial => busyProfiles.has(serial))) throw new Error('该 Profile 正在执行任务，请等待结束');
-      if (!additional && serials.some(serial => paidProfiles.has(serial))) throw new Error('存在已付款的 Profile，请只使用该行的附加功能按钮');
-      if (!additional && serials.some(serial => paidProfiles.needsReview(serial))) throw new Error('存在支付结果待核实的 Profile，请先核对账单，不能直接重复充值');
+      if (purchase && serials.some(serial => paidProfiles.has(serial))) throw new Error('存在已付款的 Profile，请取消勾选充值后运行附加功能');
+      if (purchase && serials.some(serial => paidProfiles.needsReview(serial))) throw new Error('存在支付结果待核实的 Profile，请先核对账单，不能直接重复充值');
       const jobId = crypto.randomUUID();
       const resultToken = privateResults.create(jobId);
       const job = {stopped:false, rowControls:new Map()};
@@ -181,12 +189,13 @@ async function handleRequest(request, response) {
           job.rowControls.set(index, stop);
           return () => { if (job.rowControls.get(index) === stop) job.rowControls.delete(index); };
         }};
-      publish({type:'job_started',jobId,message:additional ? '独立附加任务已启动' : `任务已启动：${taskRows.length} 条，并发 ${input.concurrency || 1}`});
+      publish({type:'job_started',jobId,purchase,message:additional ? '独立附加任务已启动' : `${purchase?'充值任务':'附加任务'}已启动：${taskRows.length} 条，并发 ${input.concurrency || 1}`});
       // 独立入口只传账号与 Profile，根本不进入购买服务，也不传银行卡或账单地址。
       const work = additional
         ? runAdditionalJob({...common, option:input.option, row:{adsPowerSerialNumber:input.row.adsPowerSerialNumber,
-          email:input.row.email, __uiIndex:input.row.__uiIndex}})
-        : runUpgradeJob({...input, ...common, shouldStop:() => job.stopped});
+          email:input.row.email, __uiIndex:input.row.__uiIndex}, paymentConfirmed:paidProfiles.has(input.row.adsPowerSerialNumber)})
+        : purchase ? runUpgradeJob({...input, ...common, shouldStop:() => job.stopped})
+        : runAdditionalBatch({...common, rows:input.rows, additionalOptions:input.additionalOptions, concurrency:input.concurrency, shouldStop:()=>job.stopped, isPaid:serial=>paidProfiles.has(serial)});
       work.then(results => publish({type:'job_finished',jobId,results}))
         .catch(() => publish({type:'job_failed',jobId,message:'任务执行异常，请检查当前附加结果及浏览器状态'}))
         .finally(() => { jobs.delete(jobId); serials.forEach(serial => busyProfiles.delete(serial)); });

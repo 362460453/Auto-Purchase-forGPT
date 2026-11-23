@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
 import {createPaidProfiles} from '../src/paid-profiles.mjs';
-import {initialPostPurchaseResult,interruptedPostPurchaseResult} from '../src/automation/post-purchase.mjs';
+import {initialPostPurchaseResult,interruptedPostPurchaseResult,resolveAdditionalOptions} from '../src/automation/post-purchase.mjs';
 import {inspectLoginInput} from '../src/automation/codex-driver.mjs';
 import {LOGIN_SELECTORS, inspectLoginPage, loginStateKind, assertLoginState} from '../src/automation/login-state.mjs';
 const source=(await readFile(new URL('../src/automation/gpt-upgrade.mjs',import.meta.url),'utf8')).replace(/^import .*;\n/gm,'').replace(/^export /gm,'');
@@ -30,7 +30,7 @@ test('付款记录只接受明确支付成功，兼容旧日志且不限展示�
 test('四个附加入口不调用付款，不需卡资料，只返回本项；超时保留已取得 Key',async()=>{
   for(const option of ['screenshot','invoice','cpa','2fa']){
     const events=[];let stops=0,closes=0,delay;
-    const context=vm.createContext({AsyncLocalStorage, AbortController,initialPostPurchaseResult,interruptedPostPurchaseResult,Date:{now:()=>1000},
+    const context=vm.createContext({AsyncLocalStorage, AbortController,initialPostPurchaseResult,interruptedPostPurchaseResult,resolveAdditionalOptions,Date:{now:()=>1000},
       setTimeout:(fn,ms)=>{delay=ms;return setTimeout(fn,25);},clearTimeout,
       startAdsPowerProfile:async()=>({debugPort:1}),stopAdsPowerProfile:async()=>{stops++;}});
     vm.runInContext(source,context);

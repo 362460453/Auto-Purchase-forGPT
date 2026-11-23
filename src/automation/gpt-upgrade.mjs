@@ -1498,10 +1498,10 @@ async function ensureHomePageForBillingProof(page, debugPort, onStep = () => {})
   if (homeTarget && !checkoutOpen) {
     const href = await evaluate(page, 'location.href', false, 2000).catch(() => '');
     if (isChatGptHomeUrl(href)) {
-      onStep('充值完成，已自动回到 chatgpt.com 首页');
+      onStep('ChatGPT 页面已打开，准备进入设置');
       return { page, extra: null };
     }
-    onStep('充值完成，首页已打开，立即查找左下角头像');
+    onStep('ChatGPT 首页已打开，立即查找左下角头像');
     const homePage = await connectCdp(homeTarget.webSocketDebuggerUrl);
     await homePage.command('Page.enable').catch(() => {});
     await homePage.command('Runtime.enable').catch(() => {});
@@ -1509,10 +1509,10 @@ async function ensureHomePageForBillingProof(page, debugPort, onStep = () => {})
   }
   const href = await evaluate(page, 'location.href', false, 2000).catch(() => '');
   if (isChatGptHomeUrl(href)) {
-    onStep('充值完成，已自动回到 chatgpt.com 首页');
+    onStep('ChatGPT 页面已打开，准备进入设置');
     return { page, extra: null };
   }
-  onStep('充值完成，返回 chatgpt.com 首页');
+  onStep('返回 chatgpt.com 首页');
   const navigation = await page.command('Page.navigate', { url: 'https://chatgpt.com/' });
   if (navigation?.errorText) throw new Error(`返回 ChatGPT 首页失败：${navigation.errorText}`);
   return { page, extra: null };
@@ -2041,10 +2041,15 @@ async function runPostPurchaseActions(page, profile, row, proofContext, onStep, 
       });
 }
 
-export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onEvent = () => {}, registerRowControl = () => {}}) {
-  if (!['screenshot', 'invoice', 'cpa', '2fa'].includes(option)) throw new Error('请选择一个附加功能');
+const additionalFields = {screenshot:['screenshotUrl','screenshotError','screenshotStatus'], invoice:['invoiceFileName','invoiceError','invoiceStatus'], cpa:['cpaJson','cpaError','cpaStatus'], '2fa':['twoFactorKey','twoFactorError','twoFactorStatus']};
+
+export async function runAdditionalJob({jobId, row, option, options, paymentConfirmed = false, apiBase, apiKey, onEvent = () => {}, registerRowControl = () => {}}) {
+  const selectedOptions=resolveAdditionalOptions(options ?? [option]);
+  if(!selectedOptions.length)throw new Error('至少选择一个附加功能');
+  const label=selectedOptions.join(' + ');
+  option=selectedOptions.length===1?selectedOptions[0]:undefined;
   const serialNumber = String(row?.adsPowerSerialNumber || '').trim();
-  if (!serialNumber || (option === 'cpa' && !row.email)) throw new Error('附加任务账号资料不完整');
+  if (!serialNumber || (selectedOptions.includes('cpa') && !row.email)) throw new Error('附加任务账号资料不完整');
   const index = row.__uiIndex;
   if (!Number.isInteger(index) || index < 0 || index >= 100) throw new Error('任务行号无效');
   const prefix = `第 ${index + 1} 条 / AdsPower ${serialNumber}`;
@@ -2054,13 +2059,11 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
   let page;
   let interruptionError;
   let currentStep = '启动 AdsPower';
-  let result = initialPostPurchaseResult([option]);
-  const fields = option === 'screenshot' ? ['screenshotUrl', 'screenshotError', 'screenshotStatus']
-    : option === 'invoice' ? ['invoiceFileName','invoiceError','invoiceStatus']
-    : option === 'cpa' ? ['cpaJson', 'cpaError', 'cpaStatus'] : ['twoFactorKey', 'twoFactorError', 'twoFactorStatus'];
-  // 只发布当前附加项，避免空默认值覆盖另外两项的成功结果。
+  let result = initialPostPurchaseResult(selectedOptions);
+  const fields = selectedOptions.flatMap(item=>additionalFields[item]);
+  // 只发布本次选中的附加项，避免空默认值覆盖其他已取得的结果。
   const selected = () => Object.fromEntries(fields.map(key => [key, result[key]]));
-  const emit = payload => { if (active) onEvent({index, option, ...payload}); };
+  const emit = payload => { if (active) onEvent({index, option, additionalOptions:selectedOptions, paymentConfirmed, purchase:false, ...payload}); };
   const stop = () => stopAdsPowerProfile({serialNumber, apiBase, apiKey}).catch(() => {});
   const step = message => { currentStep = message; emit({type:'step_started', message:`${prefix}：${message}`}); };
   const interruption = createRowInterruption({index, deadline, controller, registerRowControl, onInterrupt:error => {
@@ -2068,7 +2071,7 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
     if (error.code === 'ROW_STOPPED') emit({type:'row_stop_requested', message:`${prefix}：正在终止本行`});
     active = false;
   }});
-  emit({type:'additional_started', ...selected(), message:`${prefix}：单独执行 ${option}`});
+  emit({type:'additional_started', ...selected(), message:`${prefix}：执行所选附加功能：${label}`});
   const work = runWithTaskBudget(async () => {
     assertTaskActive();
     const profile = await startAdsPowerProfile({serialNumber, apiBase, apiKey, signal:controller.signal});
@@ -2078,11 +2081,11 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
     await page.command('Page.enable');
     await page.command('Runtime.enable');
     return runPostPurchaseActions(page, profile, row, {
-      jobId, index, additionalOptions:[option], isActive:() => active && Date.now() < deadline,
+      jobId, index, additionalOptions:selectedOptions, isActive:() => active && Date.now() < deadline,
       onPostPurchaseProgress: patch => {
         if (!active) return;
         result = {...result, ...patch};
-        emit({type:'additional_progress', ...selected(), message:`${prefix}：${option} 结果已更新`});
+        emit({type:'additional_progress', ...selected(), message:`${prefix}：${label} 结果已更新`});
       },
     }, step, message => emit({type:'login_verification_required', message:`${prefix}：${message}`}));
   }, () => active, deadline, controller.signal);
@@ -2090,9 +2093,9 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
     result = await Promise.race([work, interruption.wait]);
   } catch {
     const reason = interruptionError?.message || '浏览器未就绪或连接中断，请单独重试';
+    const pending=selectedOptions.filter(item=>result[`${item==='2fa'?'twoFactor':item}Status`]==='pending');
     result = interruptedPostPurchaseResult(result, reason);
-    const resultPrefix = option === '2fa' ? 'twoFactor' : option;
-    result[`${resultPrefix}Error`] = `${currentStep}未完成：${reason}`;
+    for(const item of pending)result[`${item==='2fa'?'twoFactor':item}Error`]=`${currentStep}未完成：${reason}`;
   } finally {
     interruption.finish();
     active = false;
@@ -2101,9 +2104,33 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
     await stop();
   }
   const proof = selected();
-  onEvent({type:'additional_finished', index, option, ...proof,
-    message:`${prefix}：${option} ${fields.some(key => key.endsWith('Error') && proof[key]) ? '未完成，请查看附加结果' : '已完成'}；保留付款成功状态`});
-  return [{index, ...proof}];
+  const additionalStatus=interruptionError?.code==='ROW_STOPPED'?'cancelled':fields.some(key=>key.endsWith('Error')&&proof[key])?'failed':'completed';
+  onEvent({type:'additional_finished', index, option, additionalOptions:selectedOptions, paymentConfirmed, purchase:false, additionalStatus, ...proof,
+    message:`${prefix}：${label} ${additionalStatus==='completed'?'已完成':'有未完成项，请查看附加结果'}${paymentConfirmed?'；付款成功状态保留':''}`});
+  return [{index, paymentConfirmed, additionalStatus, ...proof}];
+}
+
+export async function runAdditionalBatch({rows, additionalOptions, concurrency=1, shouldStop=()=>false, isPaid=()=>false, ...common}) {
+  const options=resolveAdditionalOptions(additionalOptions);
+  if(!options.length)throw new Error('至少选择一个附加功能');
+  const bounded=Math.max(1,Math.min(10,Math.floor(Number(concurrency)||1)));
+  // 每行只启动一次 Profile，所有所选附加功能共用该行 10 分钟；从不进入购买状态机。
+  const results=await runWithConcurrency(rows,bounded,async(row,index)=>{
+    const clean={adsPowerSerialNumber:row.adsPowerSerialNumber,email:row.email,__uiIndex:row.__uiIndex??index};
+    try{return (await runAdditionalJob({...common,row:clean,options,paymentConfirmed:isPaid(clean.adsPowerSerialNumber)}))[0];}
+    catch{
+      const proof=interruptedPostPurchaseResult(initialPostPurchaseResult(options),'附加任务校验或启动失败');
+      const selected=Object.fromEntries(options.flatMap(item=>additionalFields[item]).map(key=>[key,proof[key]]));
+      common.onEvent?.({type:'additional_finished',index:clean.__uiIndex,additionalOptions:options,purchase:false,paymentConfirmed:isPaid(clean.adsPowerSerialNumber),additionalStatus:'failed',...selected,message:`第 ${clean.__uiIndex+1} 条 / AdsPower ${clean.adsPowerSerialNumber}：附加任务校验或启动失败`});
+      return{index:clean.__uiIndex,additionalStatus:'failed',...selected};
+    }
+  },shouldStop);
+  for(let index=0;index<rows.length;index++)if(!results[index]){
+    const uiIndex=rows[index].__uiIndex??index;
+    results[index]={index:uiIndex,status:'cancelled'};
+    common.onEvent?.({type:'row_cancelled',index:uiIndex,purchase:false,message:`第 ${uiIndex+1} 条 / AdsPower ${rows[index].adsPowerSerialNumber}：排队任务已终止，未开始执行`});
+  }
+  return results;
 }
 
 async function runWithConcurrency(rows, concurrency, worker, shouldStop = () => false) {

@@ -84,11 +84,11 @@ function parseCsv(text) {
 function csvRows(text, type) {
   const records = parseCsv(text);
   const header = (records.shift() || []).map((value, index) => index === 0 ? value.replace(/^\uFEFF/, '') : value);
-  const requiredColumns = csvColumns[type] || csvColumns.ads;
+  const requiredColumns = type==='ads' ? ['adsPowerSerialNumber','email'] : (csvColumns[type] || csvColumns.ads);
   const missing = requiredColumns.filter((column) => !header.includes(column));
   if (missing.length) throw new Error(`CSV 缺少字段：${missing.join('、')}`);
-  // AdsPower 只按五列表头取值，旧模板里的密码及其他附加列不进入任务内存或请求。
-  const importedColumns = type === 'google-incognito' ? header : requiredColumns;
+  // AdsPower 始终只导入五个允许字段；只做附加任务可缺少卡字段，旧模板密码及其他列不导入。
+  const importedColumns = type === 'google-incognito' ? header : csvColumns.ads;
   return records.map((values) => Object.fromEntries(importedColumns.map((key) => [key, values[header.indexOf(key)] || ''])));
 }
 function randomInt(maxExclusive) {
@@ -132,10 +132,21 @@ function billingAddressText(row) {
     .filter(Boolean)
     .join(', ');
 }
+function purchaseSelected() { return $('#purchase-option')?.checked !== false; }
+function selectedAdditionalOptions() { return [...document.querySelectorAll('input[name="additionalOptions"]:checked')].map(input=>input.value); }
+function hasExecutionSelection() { return purchaseSelected() || selectedAdditionalOptions().length>0; }
+
 function canRetryRow(index) {
   const state = rowStates[index] || {};
-  return !jobRunning && !state.paymentConfirmed && !state.paymentReviewRequired && !['执行中', '已完成', '待核实'].includes(state.status);
+  if(jobRunning||!hasExecutionSelection()||state.status==='执行中')return false;
+  if(!purchaseSelected())return Boolean(rows[index]);
+  return !state.paymentConfirmed&&!state.paymentReviewRequired&&state.status!=='待核实'&&(state.status!=='已完成'||state.executionMode==='additional');
 }
+function retryIndexes() {
+  const indexes=purchaseSelected()?failedIndexes:rowStates.flatMap((state,index)=>state?.additionalStatus==='failed'?[index]:[]);
+  return indexes.filter(index=>canRetryRow(index));
+}
+
 function canStopRow(index) {
   const state = rowStates[index];
   return Boolean(jobRunning && activeResultAccess && state?.jobId === activeResultAccess.jobId
@@ -175,7 +186,7 @@ function startFromRow(index) {
 }
 const additionalLabels = {screenshot:'截图', invoice:'下载发票', cpa:'CPA', '2fa':'2FA'};
 function canRunAdditional(index) {
-  return rechargeType === 'ads' && !jobRunning && (rowStates[index]?.paymentConfirmed || rowStates[index]?.status === '已完成');
+  return rechargeType === 'ads' && !jobRunning && Boolean(rows[index]);
 }
 async function recoverPaidRows() {
   if (rechargeType !== 'ads') return;
@@ -217,13 +228,13 @@ function renderRows() {
     const additionalButtons = rechargeType === 'ads' ? Object.entries(additionalLabels).map(([option, label]) =>
       `<button type="button" class="row-additional" data-additional="${option}" data-row-index="${index}" title="单独执行${label}，保留付款结果"${canRunAdditional(index) ? '' : ' disabled'}>${state.additionalRunning === option ? `${label}中…` : label}</button>`).join('') : '';
     const passwordCell = rechargeType === 'google-incognito' ? `<td>${escapeHtml(row.password)}</td>` : '';
-    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td>${passwordCell}<td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.rowStopRequested ? '终止中…' : state.status || '待执行')}</td><td>${escapeHtml(twoFactorStatusText(state))}</td><td>${escapeHtml(cpaStatusText(state))}</td><td>${escapeHtml(invoiceStatusText(state))}${state.invoiceFileName ? `<button type="button" class="secondary" data-save-invoice="${index}">保存发票</button>` : ''}</td><td${reasonAttr}>${escapeHtml(reason)}</td><td class="row-actions"><button type="button" class="row-retry" data-retry-index="${index}"${retryDisabled}>重试</button><button type="button" class="row-continue" data-continue-index="${index}" title="从本行往下执行，跳过已完成或已付款行"${continueDisabled}>从本行继续</button>${stopButton}${additionalButtons}</td><td><button type="button" class="row-copy" data-copy-screenshot="${escapeHtml(state.screenshotUrl || '')}"${copyDisabled}>复制</button></td><td>${screenshot}</td></tr>`;
+    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td>${passwordCell}<td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.rowStopRequested ? '终止中…' : state.status || '待执行')}</td><td>${escapeHtml(twoFactorStatusText(state))}</td><td>${escapeHtml(cpaStatusText(state))}</td><td>${escapeHtml(invoiceStatusText(state))}${state.invoiceFileName ? `<button type="button" class="secondary" data-save-invoice="${index}">保存发票</button>` : ''}</td><td${reasonAttr}>${escapeHtml(reason)}</td><td class="row-actions"><button type="button" class="row-retry" title="按当前执行选项重试本行" data-retry-index="${index}"${retryDisabled}>重试</button><button type="button" class="row-continue" data-continue-index="${index}" title="从本行往下执行所选任务"${continueDisabled}>从本行继续</button>${stopButton}${additionalButtons}</td><td><button type="button" class="row-copy" data-copy-screenshot="${escapeHtml(state.screenshotUrl || '')}"${copyDisabled}>复制</button></td><td>${screenshot}</td></tr>`;
   }).join('');
   $('#export-results').disabled = rows.length === 0;
-  for (const control of document.querySelectorAll('#csv-file, #recharge-type, #billing-state, #concurrency, input[name=planAmount], input[name=multiplier], input[name=additionalOptions]')) control.disabled = jobRunning || (control.name === 'additionalOptions' && ['invoice', 'cpa', '2fa'].includes(control.value) && rechargeType !== 'ads');
+  for (const control of document.querySelectorAll('#purchase-option, #csv-file, #recharge-type, #billing-state, #concurrency, input[name=planAmount], input[name=multiplier], input[name=additionalOptions]')) control.disabled = jobRunning || (control.id==='purchase-option'&&rechargeType!=='ads') || (['planAmount','multiplier'].includes(control.name)&&!purchaseSelected()) || (control.name === 'additionalOptions' && ['invoice', 'cpa', '2fa'].includes(control.value) && rechargeType !== 'ads');
   $('#task-count').textContent = `${rows.length} 条`;
   $('#task-table-wrap').classList.toggle('scrollable', rows.length > 10);
-  $('#task-list').hidden = false; $('#start').disabled = jobRunning || rows.length === 0 || !rows.some((_, index) => canRetryRow(index)); $('#retry-failed').disabled = jobRunning || failedIndexes.length === 0; $('#stop-all').disabled = !jobRunning || stopRequested;
+  $('#task-list').hidden = rows.length===0; $('#start').disabled = jobRunning || !hasExecutionSelection() || rows.length === 0 || !rows.some((_, index) => canRetryRow(index)); $('#retry-failed').disabled = jobRunning || retryIndexes().length === 0; $('#stop-all').disabled = !jobRunning || stopRequested;
 }
 function loadSettingsForm() { $('#adspower-api-base').value = settings.apiBase; $('#adspower-api-key').value = settings.apiKey; }
 $('#settings-open').addEventListener('click', () => { loadSettingsForm(); $('#settings-dialog').showModal(); });
@@ -240,6 +251,7 @@ $('#recharge-type').addEventListener('change', (event) => {
   activeResultAccess = null;
   resultAccesses = [];
   rechargeType = event.target.value;
+  if(rechargeType!=='ads')$('#purchase-option').checked=true;
   for (const option of document.querySelectorAll('input[name=additionalOptions]')) {
     option.disabled = ['invoice', 'cpa', '2fa'].includes(option.value) && rechargeType !== 'ads';
     if (option.disabled) option.checked = false;
@@ -292,7 +304,7 @@ async function refreshPrivateResults() {
     const response = await fetch(`/api/jobs/${access.jobId}/results`, {
       headers: {Authorization:`Bearer ${access.resultToken}`}, cache:'no-store',
     });
-    if (!response.ok) throw new Error('CPA / 2FA 私有结果读取失败，请勿刷新页面，稍后再次导出');
+    if (!response.ok) throw new Error('附加任务私有结果读取失败，请勿刷新页面，稍后再次导出');
     const results = await response.json();
     if (accesses !== resultAccesses) return;
     for (const result of results) {
@@ -308,6 +320,20 @@ async function refreshPrivateResults() {
   }
   renderRows();
 }
+function mergeAdditionalResult(previous,payload,options,jobId) {
+  const next={...previous};
+  const keys={screenshot:'screenshotUrl',invoice:'invoiceFileName',cpa:'cpaJson','2fa':'twoFactorKey'};
+  for(const option of options){
+    if(!keys[option])continue;
+    const prefix=option==='2fa'?'twoFactor':option;
+    for(const field of [`${prefix}Status`,`${prefix}Error`])if(field in payload)next[field]=payload[field];
+    const key=keys[option];
+    if(key==='screenshotUrl'){if(payload[key])next[key]=payload[key];}
+    else if(payload[`${key}Available`]){next[`${key}Available`]=true;next[`${key}JobId`]=jobId;}
+  }
+  return next;
+}
+
 const events = new EventSource('/api/events');
 events.onmessage = (event) => {
   const payload = JSON.parse(event.data);
@@ -319,8 +345,12 @@ events.onmessage = (event) => {
     for (const state of rowStates) {
       state.rowStopRequested = false;
       if (state.additionalRunning) {
-        const prefix = state.additionalRunning === '2fa' ? 'twoFactor' : state.additionalRunning;
-        state[`${prefix}Status`] = 'failed'; state[`${prefix}Error`] = '附加任务中断，请单独重试';
+        for(const option of state.additionalRunning.split(',')){
+          const prefix=option==='2fa'?'twoFactor':option;
+          if(!['completed','already_enabled'].includes(state[`${prefix}Status`])){state[`${prefix}Status`]='failed';state[`${prefix}Error`]='附加任务中断，请单独重试';}
+        }
+        state.additionalStatus='failed';
+        if(!state.paymentConfirmed&&!state.paymentReviewRequired)state.status='附加异常';
         state.additionalRunning = '';
       }
     }
@@ -335,20 +365,20 @@ events.onmessage = (event) => {
       previous.subscriptionType = payload.subscriptionType || previous.subscriptionType;
     }
     if (['additional_started', 'additional_progress', 'additional_finished'].includes(payload.type)) {
-      const prefix = payload.option === '2fa' ? 'twoFactor' : payload.option;
-      const key = payload.option === '2fa' ? 'twoFactorKey' : payload.option === 'cpa' ? 'cpaJson' : payload.option === 'invoice' ? 'invoiceFileName' : 'screenshotUrl';
-      const patch = {jobId:payload.jobId, paymentConfirmed:true, status:'已完成', reason:'',
-        additionalRunning:payload.type === 'additional_finished' ? '' : payload.option};
-      for (const field of [`${prefix}Status`, `${prefix}Error`]) if (field in payload) patch[field] = payload[field];
-      if (key === 'screenshotUrl') { if (payload[key]) patch[key] = payload[key]; }
-      else if (payload[`${key}Available`]) {
-        patch[`${key}Available`] = true; patch[`${key}JobId`] = payload.jobId;
-      }
-      rowStates[payload.index] = {...previous, ...patch};
+      const options=payload.additionalOptions || (payload.option?[payload.option]:previous.additionalOptions||[]);
+      const paid=Boolean(previous.paymentConfirmed||payload.paymentConfirmed);
+      const finished=payload.type==='additional_finished';
+      const failed=payload.additionalStatus==='failed'||options.some(option=>(payload[`${option==='2fa'?'twoFactor':option}Status`]||previous[`${option==='2fa'?'twoFactor':option}Status`])==='failed');
+      rowStates[payload.index]={...mergeAdditionalResult(previous,payload,options,payload.jobId),jobId:payload.jobId,
+        paymentConfirmed:paid,executionMode:'additional',additionalOptions:options,reason:'',
+        additionalStatus:finished?(payload.additionalStatus||(failed?'failed':'completed')):'running',
+        status:previous.paymentReviewRequired?'待核实':!finished?'执行中':paid?'已完成':payload.additionalStatus==='cancelled'?'已取消':failed?'附加异常':'已完成',
+        subscriptionType:paid||previous.paymentReviewRequired?previous.subscriptionType:'',
+        additionalRunning:finished?'':options.join(','),completedAt:finished?payload.timestamp:''};
     }
     // 保留每行本次执行的套餐快照，后续修改全局规格不能改写已完成账号的导出结果。
     if (payload.type === 'row_started' || payload.type === 'browser_started') {
-      rowStates[payload.index] = {...previous, jobId:payload.jobId, status:'执行中', reason:'', screenshotUrl:'', screenshotError:'', invoiceFileName:'', invoiceError:'', invoiceStatus:'', completedAt:'',
+      rowStates[payload.index] = {...previous, jobId:payload.jobId, status:'执行中',executionMode:'purchase',reason:'',completedAt:'',
         subscriptionType:payload.subscriptionType || previous.subscriptionType,
         additionalOptions:payload.additionalOptions || previous.additionalOptions};
     }
@@ -357,24 +387,15 @@ events.onmessage = (event) => {
       failedIndexes = [...new Set([...failedIndexes, payload.index])];
     }
     if (payload.type === 'post_purchase_progress') {
-      rowStates[payload.index] = {...previous, screenshotUrl:payload.screenshotUrl || '',
-        screenshotError:payload.screenshotError || '', screenshotStatus:payload.screenshotStatus,
-        invoiceStatus:payload.invoiceStatus, invoiceError:payload.invoiceError || '', invoiceFileNameAvailable:payload.invoiceFileNameAvailable,
-        twoFactorStatus:payload.twoFactorStatus, twoFactorError:payload.twoFactorError || '',
-        cpaStatus:payload.cpaStatus, cpaError:payload.cpaError || '', cpaJsonAvailable:payload.cpaJsonAvailable,
-        twoFactorKeyAvailable:payload.twoFactorKeyAvailable};
+      rowStates[payload.index]=mergeAdditionalResult(previous,payload,previous.additionalOptions||[],payload.jobId);
     }
     if (payload.type === 'row_succeeded') {
-      rowStates[payload.index] = {...previous, paymentConfirmed:true, status:'已完成', reason:'', screenshotUrl:payload.screenshotUrl || '',
-        screenshotError:payload.screenshotError || '', screenshotStatus:payload.screenshotStatus,
-        invoiceStatus:payload.invoiceStatus, invoiceError:payload.invoiceError || '', invoiceFileNameAvailable:payload.invoiceFileNameAvailable, completedAt:payload.timestamp,
-        twoFactorStatus:payload.twoFactorStatus, twoFactorError:payload.twoFactorError || '',
-        cpaStatus:payload.cpaStatus, cpaError:payload.cpaError || '', cpaJsonAvailable:payload.cpaJsonAvailable,
-        twoFactorKeyAvailable:payload.twoFactorKeyAvailable};
+      rowStates[payload.index]={...mergeAdditionalResult(previous,payload,previous.additionalOptions||[],payload.jobId),paymentConfirmed:true,status:'已完成',reason:'',completedAt:payload.timestamp};
       failedIndexes = failedIndexes.filter((index) => index !== payload.index);
     }
     if (payload.type === 'row_cancelled') {
-      rowStates[payload.index] = {...previous, paymentReviewRequired:Boolean(payload.paymentReviewRequired), status:payload.paymentReviewRequired ? '待核实' : '已取消', reason:payload.message || '排队任务已终止，未开始执行', completedAt:payload.timestamp};
+      const review=payload.purchase===false?previous.paymentReviewRequired:Boolean(payload.paymentReviewRequired);
+      rowStates[payload.index]={...previous,paymentReviewRequired:review,status:review?'待核实':payload.purchase===false&&previous.paymentConfirmed?'已完成':'已取消',reason:payload.message||'排队任务已终止，未开始执行',completedAt:payload.timestamp};
       failedIndexes = failedIndexes.filter((index) => index !== payload.index);
     }
     if (payload.type === 'payment_confirmation_required') {
@@ -511,7 +532,7 @@ $('#export-results').addEventListener('click', async () => {
   if (!rows.length) return;
   try { await refreshPrivateResults(); }
   catch (error) { $('#activity').textContent = error.message; return; }
-  const blob = new Blob([buildResultsCsv(rows, rowStates, selectedSubscriptionType())], {type:'text/csv;charset=utf-8'});
+  const blob = new Blob([buildResultsCsv(rows, rowStates, purchaseSelected()?selectedSubscriptionType():'')], {type:'text/csv;charset=utf-8'});
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
   link.download = `gpt-results-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
@@ -544,7 +565,7 @@ async function startAdditional(index, option) {
   const previousAccess = activeResultAccess;
   jobRunning = true;
   activeResultAccess = null;
-  rowStates[index] = {...rowStates[index], paymentConfirmed:true, additionalRunning:option};
+  rowStates[index] = {...rowStates[index], additionalRunning:option,executionMode:'additional'};
   renderRows();
   try {
     const response = await fetch('/api/jobs/additional', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -567,16 +588,21 @@ async function startAdditional(index, option) {
 
 async function startJob(taskRows) {
   if (jobRunning || !taskRows.length) return;
+  if(!hasExecutionSelection()){$('#validation').hidden=false;$('#validation').textContent='请至少选择充值或一个附加功能';return;}
+  const rowsSnapshot=rows;
+  try{await refreshPrivateResults();}catch(error){$('#activity').textContent=error.message;return;}
+  if(jobRunning||rows!==rowsSnapshot)return;
+  const purchase=purchaseSelected(),additionalOptions=selectedAdditionalOptions();
+  if(!purchase&&!additionalOptions.length)return;
   activeResultAccess = null;
-  const additionalOptions = [...document.querySelectorAll('input[name="additionalOptions"]:checked')].map((input) => input.value);
-  const subscriptionType = selectedSubscriptionType();
-  // 本批选项在启动时固定，重试按本次选择执行；已成功的行不重复充值。
-  taskRows = taskRows.map((row, index) => ({...row, __uiIndex:row.__uiIndex ?? index}))
-    .filter((row) => canRetryRow(row.__uiIndex));
-  if (!taskRows.length) return;
-  for (const row of taskRows) rowStates[row.__uiIndex] = {status:'待执行', subscriptionType, additionalOptions};
-  const input = {rows:taskRows, concurrency:Number($('#concurrency').value), product:$('#product').value,
-    rechargeType, ...selectedPlan(), additionalOptions, apiBase:settings.apiBase, apiKey:settings.apiKey};
+  const subscriptionType=purchase?selectedSubscriptionType():'';
+  taskRows=taskRows.map((row,index)=>({...row,__uiIndex:row.__uiIndex??index})).filter(row=>canRetryRow(row.__uiIndex));
+  if(!taskRows.length)return;
+  for(const row of taskRows){const previous=rowStates[row.__uiIndex]||{};rowStates[row.__uiIndex]={...previous,status:'待执行',completedAt:'',executionMode:purchase?'purchase':'additional',additionalOptions,subscriptionType:purchase?subscriptionType:(previous.paymentConfirmed||previous.paymentReviewRequired?previous.subscriptionType:'')};}
+  // 只执行附加功能时不传卡资料或 Billing 地址，后台也再次剔除；不把所选充值金额当成已订阅套餐。
+  const input={rows:purchase?taskRows:taskRows.map(row=>({adsPowerSerialNumber:row.adsPowerSerialNumber,email:row.email,__uiIndex:row.__uiIndex})),
+    purchase,concurrency:Number($('#concurrency').value),rechargeType,additionalOptions,apiBase:settings.apiBase,apiKey:settings.apiKey,
+    ...(purchase?{product:$('#product').value,...selectedPlan()}:{})};
   jobRunning = true;
   stopRequested = false;
   renderRows();
@@ -598,8 +624,10 @@ async function startJob(taskRows) {
   }
 }
 
+document.addEventListener('change',event=>{if(event.target?.id==='purchase-option'||event.target?.name==='additionalOptions')renderRows();});
+
 $('#start').addEventListener('click', () => startJob(rows));
-$('#retry-failed').addEventListener('click', () => { const retryRows = failedIndexes.map((index) => ({...rows[index], __uiIndex:index})); if (retryRows.length) startJob(retryRows); });
+$('#retry-failed').addEventListener('click', () => { const retryRows = retryIndexes().map((index) => ({...rows[index], __uiIndex:index})); if (retryRows.length) startJob(retryRows); });
 $('#stop-all').addEventListener('click', async () => {
   stopRequested = true;
   renderRows();

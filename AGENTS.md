@@ -66,7 +66,7 @@ npm run check
 
 ## 4. CSV 与设置数据契约
 
-AdsPower CSV 使用五列，不读取密码，列名区分大小写：
+AdsPower 允许导入以下五列，不读取密码，列名区分大小写；仅执行附加功能时只要求编号和邮箱，充值时五项必填：
 
 ```text
 adsPowerSerialNumber,email,cardNumber,expires_at,cvv
@@ -109,6 +109,7 @@ Billing 地址规则：
 - `product`：当前只能是 `Pro`。
 - AdsPower 使用 `planAmount`：`"100"`、`"200"`、`"500"`（也接受同值数字），默认 `"200"`。HTTP 接口在启动任务前校验。
 - 未刷新的旧客户端仍可传 `multiplier`：`20x` 映射 `200`，`5x` 映射 `100`；新客户端不再用倍率表示 AdsPower 规格。无痕模式仍传原有 `multiplier`。
+- `purchase`：布尔值，缺省 true；false 只执行附加选项，至少选择一项，仅 AdsPower 支持。只做附加不要求本机付款记录，不接收卡和 Billing 地址，也不记录付款成功。
 - `additionalOptions`：数组，可选 `screenshot`、`invoice`、`cpa`、`2fa`；发票 / CPA / 2FA 仅支持 AdsPower。空数组不执行附加任务，缺省兼容旧客户端默认截图。顺序固定为截图 → 下载发票 → CPA → 2FA，未勾选的步骤不执行。
 - `apiBase`、`apiKey`：AdsPower 设置。
 
@@ -222,7 +223,7 @@ Stripe 的银行卡和 Billing 地址位于独立 iframe Target，不在 ChatGPT
 - 不实现“自动重试三次”或整行自动重跑。
 - 页面底部“重试”只重新提交全部失败行；每一行操作列的“重试”只重新提交该行。两种重试都通过 `__uiIndex` 映射回原表格行，并复用该行首次绑定的账号、卡和地址。
 - 单个 UI 控件因页面水合被吞点击时，可以仅补点该控件一次；有效期和 CVV 吞键时，可以仅慢速重输该字段一次；卡号被 Stripe 刷新打断时，等待 Card 表单出现后继续输入剩余位数。这些局部恢复不能扩大成整条任务自动重试。
-- 达到 `row_succeeded` 后不再算失败，也不进入“重试”列表；单行重试和重新启动整批也跳过已完成行。
+- 达到 `row_succeeded` 后不再算失败，也不进入“重试”列表；充值单行重试和启动整批跳过已付款行；纯附加执行可以重新执行已完成行。
 - 仅在支付成功回调后设置 `paymentConfirmed`，不得用步骤文字（如第一次点击、支付处理中）推断成功。未确认成功时拒付/超时仍为失败；确认成功后的截图异常单独记入 `screenshotError`，CPA 异常记入 `cpaError`，2FA 异常记入 `twoFactorError`；总超时保留已有截图、CPA JSON 和 Key，不得重跑充值。
 
 ## 10. AdsPower 生命周期
@@ -234,7 +235,7 @@ Stripe 的银行卡和 Billing 地址位于独立 iframe Target，不在 ChatGPT
 
 ## 11. 前端状态规则
 
-- 充值前提供多选附加项：截图默认勾选；启用并导出 2FA、导出 CPA 可选（仅 AdsPower）。启动时固定本批选项，执行中不可改动或重新导入。
+- 执行选项独立多选充值、截图、发票、CPA、2FA；默认充值+截图。主按钮启动所选任务。纯附加批量任务允许没有本地付款记录的 Profile，接口必须剔除卡/地址且不进入购买服务；执行成功不得设置付款成功或写付款日志。启动时固定本批选项，执行中不可改动或重新导入。
 - 导入成功后立即在下方展示完整任务列表和绑定地址。
 - “导出 CSV”下载当前所有任务，包含邮箱、密码（保留兼容列，AdsPower 新导入任务为空）、订阅类型、cpa、2fa、AdsPower编号、任务状态、失败原因、截图状态、结束时间、2FA状态、CPA状态。cpa 为本次有效授权后得到的紧凑 JSON，2fa 为本次读取的 Key，失败/未确认也保留 Key 并在状态列注明；不导出卡资料和完整地址。已提交任务的订阅类型取本行执行快照，不被后续全局规格覆盖。导出用 UTF-8 BOM、CRLF 和标准引号转义，只在浏览器生成文件，不经服务端日志。
 - 任务超过 10 条时表格固定高度滚动；执行日志超过 10 条时日志区固定高度滚动。
@@ -332,8 +333,8 @@ AdsPower 启动
 
 - 每次任务从开始执行起一共 10 分钟，包含浏览器启动。购买任务内的截图 → 下载发票 → CPA → 2FA 与购买过程共用原截止时间，不增加任何附加时长。用户单独发起一个附加任务时，该次任务也只建立一次 10 分钟截止时间，内部小阶段同样共享。
 - `runAdditionalJob` 与购买服务分离，仅调用共用附加动作。`POST /api/jobs/additional` 每次只接收一个 `option` 和 Profile/账号/行号，不传银行卡及地址，不进入充值状态机。
-- 服务从完整本地日志恢复已付款 Profile（兼容旧 `row_succeeded` 及新 `row_payment_confirmed`），`GET /api/paid-profiles` 用于导入时恢复付款状态和套餐。已有付款记录禁止再走购买接口；同一 Profile 跨批次互斥。付款记录按 Profile 编号匹配，不能用于换绑其他账号后的重复购买。
-- 已付款行始终禁用充值重试；操作列单独提供截图、CPA、2FA。独立执行发 `additional_started` / `additional_progress` / `additional_finished`，只更新当前项字段，失败不进入充值失败列表。
+- 服务从完整本地日志恢复已付款 Profile（兼容旧 `row_succeeded` 及新 `row_payment_confirmed`），`GET /api/paid-profiles` 用于导入时恢复付款状态和套餐。付款记录只用于禁止再次购买，不能作为附加任务的准入条件；同一 Profile 跨批次互斥。付款记录按 Profile 编号匹配，不能用于换绑其他账号后的重复购买。
+- 已付款行始终禁用充值重试；所有 AdsPower 行均可单独执行截图、发票、CPA、2FA，不要求本机有付款日志。独立执行发 `additional_started` / `additional_progress` / `additional_finished`，只更新当前项字段，失败不进入充值失败列表。
 - 秘密按字段及批次来源读取，新失败的空结果不能擦掉上次已取回的 Key/CPA；其他附加项结果不受影响。刷新页面只能恢复付款记录，不能恢复秘密，仍需先导出。
 - 返回首页 → 可点击头像 → Settings 菜单 → 设置内容 → Billing 套餐与邮箱完整。所有页面等待共用本次任务剩余时间，不再单独使用 60/8/10/20 秒结束阶段。新版主页优先精确识别 Open profile menu，继续使用 CDP 鼠标。CPA 输入逐字符及 Tab 后按实际内容校验，最多慢速重输当前字段一次，不另设 1.5 秒阶段超时。
 - 2026-11-22 已在 14622 实机确认独立截图从启动到关闭 Profile 成功，Paid / Pro 200 与 Billing email 同时入镜；CPA 输入修复和独立 2FA 入口仅模拟验证，没有新增实际授权或启用结果。
@@ -345,10 +346,21 @@ AdsPower 启动
 
 ## 19. 下载发票
 
-- AdsPower 新增 `invoice` 附加选项，默认不选；自动顺序截图 → 下载发票 → CPA → 2FA。已付款行提供下载发票单项入口。购买内附加与原任务共用 10 分钟；独立发起时该次任务也只建立一个 10 分钟截止时间。
+- AdsPower 新增 `invoice` 附加选项，默认不选；自动顺序截图 → 下载发票 → CPA → 2FA。所有导入的 AdsPower 行提供下载发票单项入口。购买内附加与原任务共用 10 分钟；独立发起时该次任务也只建立一个 10 分钟截止时间。
 - 在 Billing 的 `table[aria-label="Transaction history"]` 按 Date 列选最新记录，只点该行唯一 `a[aria-label^="Open invoice"]`。不用 Expense this，不借用其他交易/已有发票标签。真实鼠标滚动到内容视区，坐标稳定后点击。
 - 新页面必须是当前交易对应的 `invoice.stripe.com`。真实鼠标点唯一 Download invoice，忽略 Download receipt；Browser 下载事件须来自当前发票 frame，并确认 completed；校验 `%PDF-` 与 `%%EOF` 后才成功。新标签及下载临时目录结束时清理，原有标签保留。
 - PDF 写入 `data/invoices/` 并本地保留，不随服务关闭删除；不进 Git。临时下载只用本次独立目录，失败/终止不删除其他行或已完成文件。
 - `invoiceFileName` 仅由批次令牌接口读取，SSE 提供可用性，日志不保存文件名/路径、发票 URL、PDF 或 Billing 资料。发票接口 `GET /api/jobs/:jobId/invoices/:index` 必须 Bearer 验证并精确对应行号，Cache-Control no-store。
 - 发票失败只更新 invoiceStatus/invoiceError，保留已付款与其他附加结果，不进入充值重试。新失败的空结果不擦掉旧发票；前端按文件来源批次保存。CSV 仅增加发票状态。
 - 2026-11-23 在 14651 实机验证最新交易 → 新发票标签 → Download invoice → completed → 37,676 字节完整 PDF；未充值、未下载 receipt。
+
+## 20. 充值和附加功能独立组合
+
+- 主页面的充值是独立复选框，默认勾选，附加项默认截图。选择充值走 runUpgradeJob；不选充值走 runAdditionalBatch，不能经过价格、卡或支付状态机。保留旧 HTTP 客户端缺省充值行为。
+- 只做附加的 CSV 可只带 adsPowerSerialNumber、email，未提供卡字段设空；模板仍提供五列。客户端及服务端均只向附加服务传 Profile、邮箱和原 UI 行号。
+- 纯附加批量任务每行只启动一次浏览器，所选项共用一次 10 分钟截止时间。共用原顺序并发池，失败/完成释放空位，停止排队取消未领取行，终止本行只中止当前行。
+- 多项附加事件包含 additionalOptions、purchase:false、additionalStatus。paymentConfirmed 只能来源于已有真实付款记录；没有付款记录的附加成功不能生成 row_succeeded / row_payment_confirmed 或写入付款台账。
+- 前端要区分执行完成和付款成功，保留待核实付款标记、未选附加项及以前取得的秘密和文件。无付款记录的纯附加行不使用当前全局充值金额伪造订阅类型；已知套餐保持原快照。
+- 从本行继续、主启动按当前执行选项确定可执行行：充值跳过已付款/待核实，纯附加允许重复执行；所有选项执行期间锁定。单项按钮可在任何导入 AdsPower 行使用。
+
+- 批量重试按当前模式取行：充值使用充值失败列表，纯附加仅重试 additionalStatus=failed 的行；两种失败不能混合，已付款的附加异常仍允许纯附加重试。

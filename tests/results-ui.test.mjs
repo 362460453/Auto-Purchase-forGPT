@@ -244,7 +244,7 @@ test('支付待核实行不能单行重试、全量启动或从本行继续，�
   await vm.runInContext('startFromRow(0)',context);assert.deepEqual(posted.rows.map(row=>row.__uiIndex),[1]);
   vm.runInContext('jobRunning=false;rowStates[0]={}',context);
   await vm.runInContext('recoverPaidRows()',context);
-  assert.equal(vm.runInContext('rowStates[0].status',context),'待核实');assert.equal(vm.runInContext('canRunAdditional(0)',context),false);
+  assert.equal(vm.runInContext('rowStates[0].status',context),'待核实');assert.equal(vm.runInContext('canRunAdditional(0)',context),true);
   assert.equal(vm.runInContext('canRetryRow(0)',context),false);
 });
 
@@ -271,4 +271,47 @@ test('单项发票下载只传账号及 Profile，按原批次保存 PDF，失�
  vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);
  assert.equal(vm.runInContext('rowStates[0].invoiceFileName',context),'invoice-private.pdf');
  const csv=vm.runInContext('buildResultsCsv(rows,rowStates)',context);assert.ok(csv.includes('发票状态'));assert.ok(!csv.includes('invoice-private.pdf'));
+});
+
+
+test('只选截图与发票时整批提交所有行，不传支付资料，不伪造付款或覆盖原结果',async()=>{
+ const {context,elements}=uiFixture();
+ context.csv='adsPowerSerialNumber,email\npaid,fixture@example.invalid\nunknown,other@example.invalid\n';
+ vm.runInContext("rows=csvRows(csv,'ads');rowStates.push({paymentConfirmed:true,status:'已完成',subscriptionType:'Pro / $500 / 月',twoFactorKey:'saved-key'},{status:'失败',subscriptionType:'Pro / $200 / 月'});$('#purchase-option').checked=false;",context);
+ context.document.querySelectorAll=selector=>selector==='input[name="additionalOptions"]:checked'?[{value:'screenshot'},{value:'invoice'}]:[];
+ let posted;context.fetch=async(url,init)=>{
+  if(url==='/api/jobs'){posted=JSON.parse(init.body);return{ok:true,json:async()=>({jobId:'extras',resultToken:'token'})};}
+  return{ok:true,json:async()=>[{index:1,invoiceFileName:'fixture.pdf'}]};
+ };
+ await vm.runInContext('startJob(rows)',context);
+ assert.equal(posted.purchase,false);assert.deepEqual(posted.additionalOptions,['screenshot','invoice']);
+ assert.equal(posted.rows.length,2);assert.deepEqual(Object.keys(posted.rows[0]),['adsPowerSerialNumber','email','__uiIndex']);
+ assert.ok(!('product'in posted));assert.ok(!('planAmount'in posted));assert.equal(vm.runInContext('rowStates[0].twoFactorKey',context),'saved-key');
+ context.payload={type:'additional_started',jobId:'extras',index:1,purchase:false,paymentConfirmed:false,additionalOptions:['screenshot','invoice']};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);
+ assert.equal(vm.runInContext('rowStates[1].status',context),'执行中');assert.equal(vm.runInContext('rowStates[1].paymentConfirmed',context),false);
+ context.payload={type:'additional_finished',jobId:'extras',index:1,purchase:false,paymentConfirmed:false,additionalOptions:['screenshot','invoice'],additionalStatus:'completed',screenshotStatus:'completed',screenshotUrl:'/fixture.png',invoiceStatus:'completed',invoiceFileNameAvailable:true};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);await vm.runInContext('refreshPrivateResults()',context);
+ assert.equal(vm.runInContext('rowStates[1].paymentConfirmed',context),false);assert.equal(vm.runInContext('rowStates[1].invoiceFileName',context),'fixture.pdf');
+ context.payload={type:'additional_finished',jobId:'extras',index:1,purchase:false,paymentConfirmed:false,additionalOptions:['screenshot','invoice'],additionalStatus:'failed',invoiceStatus:'failed',invoiceError:'fixture'};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)});jobRunning=false;renderRows()',context);
+ assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(retryIndexes())',context)),[1]);assert.equal(elements.get('#retry-failed').disabled,false);
+ vm.runInContext("$('#purchase-option').checked=true;renderRows()",context);assert.equal(elements.get('#retry-failed').disabled,true);
+ vm.runInContext("$('#purchase-option').checked=false",context);
+
+ vm.runInContext('jobRunning=false;renderRows()',context);assert.equal(vm.runInContext('canRetryRow(0)',context),true);
+ vm.runInContext("$('#purchase-option').checked=true",context);assert.equal(vm.runInContext('canRetryRow(0)',context),false);assert.equal(vm.runInContext('canRetryRow(1)',context),true);
+ const csv=vm.runInContext("buildResultsCsv(rows,rowStates,'Pro / $200 / 月')",context);context.resultCsv=csv;
+ const records=JSON.parse(vm.runInContext('JSON.stringify(parseCsv(resultCsv))',context));assert.equal(records[2][2],'');assert.equal(records[1][2],'Pro / $500 / 月');
+});
+
+test('充值可单独运行；无执行项时禁用启动；附加完成后仍保留待核实付款保护',async()=>{
+ const {context,elements}=uiFixture();vm.runInContext("rows=[{adsPowerSerialNumber:'fixture',email:'fixture@example.invalid'}];rowStates.push({});$('#purchase-option').checked=false;",context);
+ context.document.querySelectorAll=()=>[];let calls=0,posted;
+ context.fetch=async(_url,init)=>{calls++;posted=JSON.parse(init.body);return{ok:true,json:async()=>({jobId:'fixture',resultToken:'token'})};};
+ vm.runInContext('renderRows()',context);assert.equal(elements.get('#start').disabled,true);await vm.runInContext('startJob(rows)',context);assert.equal(calls,0);
+ vm.runInContext("$('#purchase-option').checked=true",context);await vm.runInContext('startJob(rows)',context);assert.equal(posted.purchase,true);assert.deepEqual(posted.additionalOptions,[]);
+ vm.runInContext("rowStates[0]={paymentReviewRequired:true,status:'待核实'}",context);
+ context.payload={type:'additional_finished',index:0,option:'screenshot',purchase:false,paymentConfirmed:false,screenshotStatus:'completed'};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);assert.equal(vm.runInContext('rowStates[0].status',context),'待核实');
 });

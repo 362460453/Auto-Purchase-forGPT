@@ -27,7 +27,7 @@ export function buildResultsCsv(rows, states, pendingSubscriptionType = '') {
       : state.screenshotStatus === 'skipped' ? '未勾选'
       : state.additionalOptions?.includes('screenshot') ? '未完成' : '';
     // 只导出本次流程读取的 Key，绝不从导入文件伪造；未确认启用时由独立状态列明确标记。
-    return [row.email, row.password, state.subscriptionType || pendingSubscriptionType, state.cpaJson || '', state.twoFactorKey || '',
+    return [row.email, row.password, state.subscriptionType || (state.executionMode==='additional'?'':pendingSubscriptionType), state.cpaJson || '', state.twoFactorKey || '',
       row.adsPowerSerialNumber, state.status || '待执行', state.reason || '', screenshotStatus, state.completedAt || '', twoFactorStatusText(state), cpaStatusText(state), invoiceStatusText(state)];
   });
   // UTF-8 BOM 便于 Excel/WPS 识别中文；RFC 4180 转义保留密码中的逗号、引号和换行。
