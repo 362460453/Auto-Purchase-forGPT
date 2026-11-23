@@ -34,7 +34,7 @@
 | `src/automation/adspower.mjs` | AdsPower Local API 启停 Profile | 外部 API Client |
 | `src/temp-screenshots.mjs` | 临时截图目录与退出清理 | 临时文件 |
 | `dev.mjs` | 轮询源文件并重启服务进程 | 本地开发启动器 |
-| `start-mac.command` / `start-local.sh` | Mac 单文件启动器及旧入口兼容，自动下载/更新后运行 | 启动脚本 |
+| `start-mac.command` / `start-local.sh` | Mac 单文件启动器及本机项目入口，自动下载/更新后运行 | 启动脚本 |
 | `start-windows.bat` / `start-windows.ps1` | Windows 两文件启动器，自动安装依赖、下载/更新后运行 | 启动脚本 |
 | `data/logs/*.jsonl` | 按天保存执行事件 | 本地审计日志 |
 
@@ -42,8 +42,8 @@
 
 ## 3. 启动与检查
 
-- Mac 单独分发 `start-mac.command`，双击即可；仓库内原来的 `./start-local.sh` 转到此入口。
-- Windows 分发 `start-windows.bat` 和 `start-windows.ps1`，同目录放置，只双击 BAT。仓库内旧入口保留转发兼容。
+- Mac 单独分发 `start-mac.command`，双击即可；本地开发在项目目录运行 `./start-local.sh`，复用同一入口。
+- Windows 分发 `start-windows.bat` 和 `start-windows.ps1`，同目录放置，只双击 BAT。只保留 Windows、Mac、本地开发三个场景的四个脚本；不要恢复已删除的旧 Windows 入口。
 - 两系统统一：Node.js 22+ / Git 检查 → 没有项目下载 main → 已有项目快进更新 → `node dev.mjs`。本机优先用脚本所在项目，单独启动器默认用用户目录 `Auto-Purchase-forGPT`，支持 `GPT_UPGRADE_PROJECT_DIR`。
 - Windows 用 winget 安装依赖并显式检查退出码；PowerShell 保留 UTF-8 BOM。Mac 缺 Node 时下载官方 22 LTS、核对 SHA256 并使用用户缓存；缺 Git 时调起苹果 Command Line Tools，等待用户完成系统安装。
 - 本地修改、非 main 或分歧必须保留，不得 `reset --hard` 或强制切分支；网络更新失败允许明确提示后使用已有版本。首次下载用临时目录，完整后再移入目标，失败不得污染目标。

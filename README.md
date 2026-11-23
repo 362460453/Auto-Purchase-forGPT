@@ -24,6 +24,7 @@ AdsPower CSV 使用上述五列，不需要密码。旧模板仍可导入，但 
 
 - **Windows**：发送 `start-windows.bat` 和 `start-windows.ps1`，放在同一文件夹，双击 BAT。PowerShell 文件保留 UTF-8 BOM，支持 Windows PowerShell 5.1。
 - **Mac**：只发送 `start-mac.command`，双击运行，支持 Apple Silicon 和 Intel。建议发送启动文件 ZIP，解压后运行，以保留可执行权限。
+- **本地开发**：在项目目录运行 `./start-local.sh`，复用本机项目和同一套启动流程。
 
 两个系统使用相同流程：检查 Node.js 22+ 和 Git → 没有项目则从 GitHub 的 main 下载 → 已有项目则快进更新 main → 启动本地服务。首次下载到用户目录下的 `Auto-Purchase-forGPT`；启动文件放在本项目目录时优先使用当前项目，所以开发机也使用同一入口。也可用环境变量 `GPT_UPGRADE_PROJECT_DIR` 指定项目目录。
 
@@ -35,7 +36,7 @@ Windows 缺少 Git 或合适的 Node.js 时通过 winget 安装，需完成系�
 
 启动后手动访问 `http://127.0.0.1:4173`，不自动打开浏览器。保持启动窗口打开，按 Ctrl+C 停止。新电脑需另行安装并登录 AdsPower，开启 Local API，再在控制台“设置”填写该电脑的地址和 API-Key。
 
-仓库内原命令 `./start-local.sh` 和旧 Windows 入口仍兼容，会转到新的系统入口；给其他电脑分发时使用上面带系统名称的文件。Mac 文件若被传输工具去掉执行权限，可在终端运行 `chmod +x /实际路径/start-mac.command` 后再双击。
+只保留 Windows、Mac 和本地开发三个场景的四个脚本；已删除旧 Windows 名称 `start-local.bat`、`start-local.ps1`。给其他电脑分发时使用上面带系统名称的文件。Mac 文件若被传输工具去掉执行权限，可在终端运行 `chmod +x /实际路径/start-mac.command` 后再双击。
 
 启动器集成回归：`node --test tests/launchers.test.mjs`，使用临时 Git 仓库检查首次下载、快进更新、本地改动保护、断网降级、端口占用和错误退出。Mac 流程在 macOS 运行；Windows PowerShell 逻辑需本机有 `pwsh`（也可通过 `POWERSHELL_BIN` 指定），没有时会明确跳过，不代表 Windows 实机通过。
 
