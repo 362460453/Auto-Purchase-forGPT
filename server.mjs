@@ -143,6 +143,9 @@ async function handleRequest(request, response) {
   if (request.method === 'POST' && ['/api/jobs', '/api/jobs/additional'].includes(request.url)) {
     try {
       const input = await parseBody(request);
+      if (input.verificationPassword !== undefined && (typeof input.verificationPassword !== 'string' || input.verificationPassword.length > 1024)) {
+        throw new Error('验证密码格式无效');
+      }
       const additional = request.url.endsWith('/additional');
       if(input.purchase!==undefined&&typeof input.purchase!=='boolean')throw new Error('充值选项必须是布尔值');
       const purchase=!additional&&input.purchase!==false;
@@ -184,6 +187,8 @@ async function handleRequest(request, response) {
       jobs.set(jobId, job);
       serials.forEach(serial => busyProfiles.add(serial));
       const common = {jobId, apiBase:input.apiBase || process.env.ADSPOWER_API_BASE,
+        // 验证密码仅留在本批运行上下文，不加入任务结果、广播或磁盘日志。
+        verificationPassword: (additional ? input.option === '2fa' : input.additionalOptions.includes('2fa')) ? input.verificationPassword || '' : '',
         apiKey:input.apiKey || process.env.ADSPOWER_API_KEY, onEvent:payload => publish({jobId, ...payload}),
         registerRowControl:(index, stop) => {
           job.rowControls.set(index, stop);

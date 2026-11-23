@@ -106,7 +106,7 @@ test('付款后头像晚于旧 60 秒仍继续，未出现只在整行上限记�
     context.mouseClick=async(_page,point)=>{
       assert.ok(clock>=delay);assert.equal(point.y,700);clickedAt=clock;
     };
-    context.readSettingsMenuState=async()=>true;
+    context.readSettingsMenuState=async()=>clickedAt!==undefined;
     context.clickAndConfirm=async(_page,text)=>{assert.equal(text,'Settings');settingsClicks++;};
     if(delay===Infinity){
       const result=await context.runWithTaskBudget(() => context.captureAccountBillingProof(page,{debugPort:1}), () => clock < 600000, 600000);
@@ -123,17 +123,60 @@ test('付款后头像晚于旧 60 秒仍继续，未出现只在整行上限记�
   }
 });
 
-test('Billing 账单已加载但邮箱未入镜时直接截图，不滚动或调整位置',async()=>{
- const context=vm.createContext({AsyncLocalStorage,AbortController,setTimeout:fn=>fn()});vm.runInContext(source,context);
- const commands=[],steps=[];let loaded=false;
- const page={command:async(method,args)=>{commands.push({method,args});return{};}};
- context.openAccountSettings=async()=>({page,extra:null});
- context.readBillingPanelState=async()=>({ready:loaded,emailVisible:false,planVisible:true,wheel:{x:100,y:100}});
- context.clickAndConfirm=async(_page,label,_options,confirm)=>{assert.equal(label,'Billing');assert.equal(await confirm(),false);loaded=true;assert.equal(await confirm(),true);};
- context.saveViewportScreenshot=async()=>{assert.equal(loaded,true);await page.command('Page.captureScreenshot');return '/api/screenshots/fixture.png';};
- const result=await context.captureAccountBillingProof(page,{jobId:'fixture',index:0,debugPort:1},step=>steps.push(step));
- assert.equal(result.screenshotUrl,'/api/screenshots/fixture.png');
- assert.equal(commands.filter(c=>c.method==='Page.captureScreenshot').length,1);
- assert.equal(commands.some(c=>c.method==='Input.dispatchMouseEvent'&&c.args?.type==='mouseWheel'),false);
- assert.ok(steps.includes('Billing 已加载，直接截图'));
+test('Billing 缩放到 75%，等待慢加载邮箱完整入镜后截图；超时不截图',async()=>{
+ for(const readyAt of [90000,Infinity]){
+  let clock=0,zoomed=false,captures=0;
+  const context=vm.createContext({AsyncLocalStorage,AbortController,Date:{now:()=>clock},
+   setTimeout:(fn,ms)=>{clock+=ms;fn();},process:{platform:'darwin'},setBillingBrowserZoom:async()=>{zoomed=true;},readBillingBrowserZoom:async()=>zoomed?0.75:1});
+  vm.runInContext(source,context);
+  const page={command:async()=>({})};
+  context.openAccountSettings=async()=>({page,extra:null});
+  context.readBillingPanelState=async()=>({billingOpen:true,ready:zoomed,screenshotReady:zoomed&&clock>=readyAt,layout:'stable'});
+  context.clickAndConfirm=async(_page,label,_options,confirm)=>{assert.equal(label,'Billing');assert.equal(await confirm(),true);};
+  context.saveViewportScreenshot=async()=>{assert.ok(zoomed&&clock>=readyAt);captures++;return '/api/screenshots/fixture.png';};
+  const result=await context.runWithTaskBudget(()=>context.captureAccountBillingProof(page,{jobId:'fixture',index:0,debugPort:1}),()=>clock<600000,600000);
+  assert.equal(captures,readyAt===Infinity?0:1);
+  if(readyAt===Infinity)assert.match(result.screenshotError,/超过 10 分钟/);
+  else{assert.equal(result.screenshotUrl,'/api/screenshots/fixture.png');assert.ok(clock>=90250);}
+ }
+});
+
+
+test('设置导航第一次点击无效时 8 秒补点一次，仍使用原整行截止时间',async()=>{
+ for(const completesAt of [90000,Infinity]){
+  let clock=0,clicks=0;
+  const context=vm.createContext({AsyncLocalStorage,AbortController,Date:{now:()=>clock},setTimeout:(fn,ms)=>{clock+=ms;fn();}});
+  vm.runInContext(source,context);
+  context.clickExactText=async()=>{clicks++;};
+  const action=()=>context.clickAndConfirm({},'Billing',{retryNavigation:true},async()=>clock>=completesAt,10000,'等待账单');
+  if(completesAt===Infinity)await assert.rejects(context.runWithTaskBudget(action,()=>clock<600000,600000),/超过 10 分钟/);
+  else await context.runWithTaskBudget(action,()=>clock<600000,600000);
+  assert.equal(clicks,2);
+  assert.equal(clock,completesAt===Infinity?600000:completesAt);
+ }
+});
+
+test('设置已打开或菜单已打开时直接接续，不重复点击头像关闭菜单',async()=>{
+ for(const settingsOpen of [true,false]){
+  const context=vm.createContext({AsyncLocalStorage,AbortController});vm.runInContext(source,context);
+  const page={command:async()=>{}};
+  context.ensureHomePageForBillingProof=async()=>({page});
+  context.readSettingsPageState=async()=>settingsOpen;
+  context.readSettingsMenuState=async()=>true;
+  context.evaluate=()=>assert.fail('已有菜单不再找头像');
+  let settingsClicks=0;
+  context.clickAndConfirm=async(_page,label)=>{assert.equal(label,'Settings');settingsClicks++;};
+  await context.openAccountSettings(page,1);
+  assert.equal(settingsClicks,settingsOpen?0:1);
+ }
+});
+
+test('设置导航坐标连续移动时等待稳定后再点，不点击旧坐标',async()=>{
+ let clock=0,reads=0,clicked;
+ const context=vm.createContext({AsyncLocalStorage,AbortController,Date:{now:()=>clock},setTimeout:(fn,ms)=>{clock+=ms;fn();}});
+ vm.runInContext(source,context);
+ context.evaluate=async()=>({readyState:'complete',viewport:{width:1200,height:800},point:{x:100,y:[300,340,380,380][Math.min(reads++,3)]}});
+ context.mouseClick=async(_page,point)=>{clicked=point;};
+ await context.runWithTaskBudget(()=>context.clickExactText({},'Billing',{retryNavigation:true}),()=>clock<600000,600000);
+ assert.equal(reads,4);assert.equal(clicked.y,380);
 });

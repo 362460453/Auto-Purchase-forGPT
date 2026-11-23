@@ -4,12 +4,13 @@ import { join } from 'node:path';
 import { startAdsPowerProfile, stopAdsPowerProfile } from './adspower.mjs';
 import { startGoogleIncognitoBrowser, stopGoogleIncognitoBrowser } from './google-incognito.mjs';
 import { inspectLatestInvoice, inspectInvoiceDownload, downloadInvoicePdf } from './invoice.mjs';
+import { inspectBillingProof, setBillingBrowserZoom, readBillingBrowserZoom } from './billing-proof.mjs';
 import { screenshotDirectory } from '../temp-screenshots.mjs';
 import { resolveProSelection, inspectPricingPage, inspectProPricingCard, inspectProCheckoutOptions, inspectProCheckout, inspectCheckoutSubmitButton } from './pro-plans.mjs';
 import { resolveAdditionalOptions, completePostPurchase, initialPostPurchaseResult, interruptedPostPurchaseResult } from './post-purchase.mjs';
 import { inspectAuthenticator, configureAuthenticator } from './two-factor.mjs';
 import { exportCodexCredential } from './codex-oauth.mjs';
-import { createCodexDriver } from './codex-driver.mjs';
+import { createCodexDriver, inspectLoginInput } from './codex-driver.mjs';
 import { waitForSubscriptionPayment } from './payment-wait.mjs';
 import { LOGIN_SELECTORS, inspectLoginPage, loginStateKind, assertLoginState } from './login-state.mjs';
 
@@ -223,6 +224,11 @@ async function clickExactText(client, text, options = {}) {
           const label = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
           if (node.disabled || !visible(node) || !labels.includes(label)) return null;
           const rect = node.getBoundingClientRect();
+          if (${Boolean(options.retryNavigation)} && (rect.left + rect.width/2 < 0 || rect.left + rect.width/2 > innerWidth || rect.top + rect.height/2 < 0 || rect.top + rect.height/2 > innerHeight)) return null;
+          if (${Boolean(options.retryNavigation)} && typeof document.elementFromPoint === 'function') {
+            const hit = document.elementFromPoint(rect.left + rect.width/2, rect.top + rect.height/2);
+            if (!hit || (hit !== node && !node.contains(hit))) return null;
+          }
           return {
             label,
             x: rect.left + rect.width / 2,
@@ -282,7 +288,22 @@ async function clickExactText(client, text, options = {}) {
     options.timeoutMilliseconds || 15000,
     options.timeoutMessage || `没有找到可点击的 ${text}`,
   );
-  // React 页面可能先画出按钮再二次排版；位置连续稳定后才发送鼠标事件。
+  // 设置导航在水合时会插入菜单项；连续两次坐标稳定且仍在视口内才点击，不能复用移动前坐标。
+  if (options.retryNavigation) {
+    let previous = firstState.point;
+    const point = await waitForValue(async () => {
+      await sleep(options.stabilityMilliseconds || 600);
+      const state = await readPoint(), current = state?.point;
+      const inside = current && current.x >= 0 && current.x <= state.viewport.width
+        && current.y >= 0 && current.y <= state.viewport.height;
+      const stable = inside && previous && Math.abs(previous.x-current.x)<=2 && Math.abs(previous.y-current.y)<=2;
+      previous = inside ? current : null;
+      return stable ? current : null;
+    }, Boolean, options.timeoutMilliseconds || 15000, `等待 ${text} 位置稳定`);
+    await mouseClick(client, point);
+    return;
+  }
+  // 其他购买控件保留原有行为，设置导航的补点不能扩大到付款提交。
   await sleep(options.stabilityMilliseconds || 800);
   const stableState = await readPoint();
   const firstPoint = firstState.point;
@@ -294,8 +315,32 @@ async function clickExactText(client, text, options = {}) {
   await mouseClick(client, clickPoint);
 }
 
+async function waitForSettingsTransition(confirmState, retryClick, timeoutMilliseconds, message, onStep = () => {}) {
+  const started = Date.now();
+  let retried = false;
+  // 8 秒只触发一次当前导航控件的补点，不是阶段超时；之后仍等待原整行截止时间。
+  return waitForValue(async () => {
+    if (await confirmState()) return true;
+    if (!retried && Date.now() - started >= 8000) {
+      assertTaskActive();
+      // 重试函数必须重新读取当前坐标；目标暂时不存在时继续等，不能点击旧位置。
+      if (await retryClick()) {
+        retried = true;
+        onStep('设置导航尚未跳转，已重新定位并补点一次，继续等待页面变化');
+      }
+    }
+    return false;
+  }, Boolean, timeoutMilliseconds, message);
+}
+
 async function clickAndConfirm(client, text, options, confirmState, confirmTimeoutMilliseconds, confirmMessage) {
+  if (options.retryNavigation && await confirmState()) return true;
   await clickExactText(client, text, options);
+  if (options.retryNavigation) return waitForSettingsTransition(confirmState, async () => {
+    if (await confirmState()) return false;
+    await clickExactText(client, text, options);
+    return true;
+  }, confirmTimeoutMilliseconds, confirmMessage, options.onStep);
   try {
     return await waitForValue(confirmState, Boolean, confirmTimeoutMilliseconds, confirmMessage);
   } catch (firstError) {
@@ -1426,7 +1471,7 @@ function readBottomLeftProfilePointExpression() {
         return {
           profileMenu: /^Open profile menu$/i.test(label),
           hasPlan: /\\b(Pro|Plus|Free|Business|Team|Go|Enterprise)\\b/i.test(label),
-          x: rect.left + Math.min(28, Math.max(14, rect.width * 0.12)),
+          x: rect.left + Math.min(28, rect.width / 2),
           y: rect.top + Math.min(rect.height / 2, 28),
           top: rect.top,
           width: rect.width,
@@ -1465,14 +1510,6 @@ async function readSettingsPageState(page) {
     return settingsVisible || ((path === '/settings' || path.startsWith('/settings/'))
       && (/Settings|General|Billing|账单|设置/i.test(bodyText)));
   })()`);
-}
-
-function inspectBillingProof() {
-  const text = document.body?.innerText || '';
-  const labels = [...document.querySelectorAll('h1,h2,h3,p,span,div')];
-  const email = labels.find(node => node.textContent?.trim() === 'Billing email');
-  const plan = labels.find(node => /^ChatGPT (Pro|Plus|Team|Business|Go)(?: \d+)?$/.test(node.textContent?.trim() || ''));
-  return {ready:Boolean(email && plan) && !/Loading (settings|transactions)/i.test(text)};
 }
 
 async function readBillingPanelState(page) {
@@ -1526,27 +1563,35 @@ async function openAccountSettings(page, debugPort, onStep = () => {}) {
     await homePage.command('Page.bringToFront');
     if (await readSettingsPageState(homePage).catch(() => false)) return attached;
     onStep('等待首页左下角头像加载，与整行任务共享剩余时间，出现后立即继续');
-    const profilePoint = await waitForValue(
-      () => evaluate(homePage, readBottomLeftProfilePointExpression()),
-      (state) => Boolean(state?.point)
-        && state.point.x >= 0 && state.point.x <= state.viewport.width
-        && state.point.y >= 0 && state.point.y <= state.viewport.height,
-      PROFILE_AVATAR_WAIT_MILLISECONDS,
-      '已返回 chatgpt.com，但等待 60 秒仍未出现可点击的左下角头像',
-    );
-    await sleep(250);
-    const stableProfile = await evaluate(homePage, readBottomLeftProfilePointExpression());
-    if (!stableProfile?.point) throw new Error('账号菜单布局尚未稳定');
-    await mouseClick(homePage, stableProfile.point);
-    try {
-      await waitForValue(() => readSettingsMenuState(homePage), Boolean, 8000, '左下角头像已点击，但没有出现 Settings');
-    } catch (firstError) {
-      // 头像菜单可能被水合吞掉第一次点击；只补点头像一次，不重跑整条任务。
-      const retryPoint = await evaluate(homePage, readBottomLeftProfilePointExpression());
-      if (!retryPoint?.point) throw firstError;
-      await mouseClick(homePage, retryPoint.point);
-      await waitForValue(() => readSettingsMenuState(homePage), Boolean, 8000, firstError.message);
+    const validPoint = state => Boolean(state?.point) && state.point.x >= 0 && state.point.x <= state.viewport.width
+      && state.point.y >= 0 && state.point.y <= state.viewport.height;
+    const readPoint = () => evaluate(homePage, readBottomLeftProfilePointExpression());
+    const menuOrSettings = async () => await readSettingsPageState(homePage) || await readSettingsMenuState(homePage);
+    // 账号菜单已打开或 Settings 已由页面跳转时直接接续，避免再次点头像反而关掉菜单。
+    let previousPoint;
+    const entry = await waitForValue(async () => {
+      if (await menuOrSettings()) return {opened:true};
+      const state = await readPoint();
+      const point = validPoint(state) ? state.point : null;
+      const stable = point && previousPoint && Math.abs(point.x-previousPoint.x)<=2 && Math.abs(point.y-previousPoint.y)<=2;
+      previousPoint = point;
+      return stable ? {point} : null;
+    }, Boolean, PROFILE_AVATAR_WAIT_MILLISECONDS, '等待可点击且位置稳定的左下角头像');
+    if (!entry.opened) {
+      onStep('点击左下角头像，等待账号菜单');
+      await mouseClick(homePage, entry.point);
+      await waitForSettingsTransition(menuOrSettings, async () => {
+        const state = await readPoint();
+        if (!validPoint(state)) return false;
+        await sleep(250);
+        if (await menuOrSettings()) return false;
+        const stable = await readPoint();
+        if (!validPoint(stable) || Math.abs(state.point.x-stable.point.x)>2 || Math.abs(state.point.y-stable.point.y)>2) return false;
+        await mouseClick(homePage, stable.point);
+        return true;
+      }, PROFILE_AVATAR_WAIT_MILLISECONDS, '头像点击后等待 Settings 菜单', onStep);
     }
+    if (await readSettingsPageState(homePage)) return attached;
 
     onStep('点击 Settings');
     await clickAndConfirm(
@@ -1554,6 +1599,7 @@ async function openAccountSettings(page, debugPort, onStep = () => {}) {
       'Settings',
       {
         alternateTexts: ['设置'],
+        retryNavigation: true, onStep,
         timeoutMilliseconds: 10000,
         timeoutMessage: '头像菜单里没有找到可点击的 Settings',
         stabilityMilliseconds: 600,
@@ -1572,9 +1618,10 @@ async function openAccountSettings(page, debugPort, onStep = () => {}) {
 
 async function captureAccountBillingProof(page, { jobId, index, debugPort }, onStep = () => {}) {
   let extra = null;
+  let homePage;
   try {
     const attached = await openAccountSettings(page, debugPort, onStep);
-    const homePage = attached.page;
+    homePage = attached.page;
     extra = attached.extra;
     onStep('点击 Billing');
     await clickAndConfirm(
@@ -1582,19 +1629,31 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       'Billing',
       {
         alternateTexts: ['账单'],
+        retryNavigation: true, onStep,
         region: 'left',
         timeoutMilliseconds: 10000,
         timeoutMessage: '设置弹窗里没有找到可点击的 Billing',
         stabilityMilliseconds: 600,
       },
-      async () => (await readBillingPanelState(homePage)).ready,
+      // 进入 Billing 就先缩放，不能以尚在屏幕外的邮箱作为缩放前置条件。
+      async () => (await readBillingPanelState(homePage)).billingOpen,
       20000,
       'Billing 已点击，但账单内容没有出现',
     );
 
-    onStep('Billing 已加载，直接截图');
-    // 按用户要求保留账单当前视口，不滚动或调整邮箱位置；仅等待短暂布局稳定。
-    await sleep(300);
+    onStep('Billing 浏览器 Zoom 设置为 75%，等待 Billing email 邮箱加载并完整入镜');
+    await setBillingBrowserZoom(homePage, waitForValue, process.platform, onStep);
+    let stableLayout = '';
+    // 网络慢时邮箱值可能晚于标题；只用整行剩余时间等待，未入镜或超时不能保存缺邮箱的截图。
+    await waitForValue(async () => {
+      const state = await readBillingPanelState(homePage);
+      const zoom = await readBillingBrowserZoom(homePage);
+      if (!state.screenshotReady || Math.abs(zoom - 0.75) >= 0.005 || !Number.isFinite(zoom)) { stableLayout = ''; return false; }
+      if (stableLayout === state.layout) return true;
+      stableLayout = state.layout;
+      return false;
+    }, Boolean, ROW_TIMEOUT_MILLISECONDS, '75% 缩放后，Billing email 邮箱内容或套餐尚未完整显示');
+    onStep('75% 缩放下套餐与 Billing email 已显示，保存截图');
     const fileName = `${jobId || 'job'}-${Number(index) || 0}.png`;
     const screenshotUrl = await saveViewportScreenshot(homePage, fileName);
     return { screenshotUrl };
@@ -1654,17 +1713,23 @@ async function configureAccountTwoFactor(page, context, onStep, onProgress) {
   let extra;
   try {
     if (!context.isActive()) throw new Error('任务已结束');
-    const attached = await openAccountSettings(page, context.debugPort, onStep);
+    // 已在验证器向导或二次验证页时直接继续，避免返回首页丢掉当前 Key 和验证进度。
+    const resumable = ['enabled', 'disabled', 'intro', 'setup', 'verification_required', 'password_required'];
+    const current = await evaluate(page, `(${inspectAuthenticator.toString()})()`, false).catch(() => ({stage:'unavailable'}));
+    const attached = resumable.includes(current.stage) ? {page, extra:null} : await openAccountSettings(page, context.debugPort, onStep);
     const securityPage = attached.page;
     extra = attached.extra;
     const read = (action = 'state') => evaluate(securityPage,
-      `(${inspectAuthenticator.toString()})(${JSON.stringify(action)})`, false, 3000);
-    onStep('打开 Security and login');
-    // 安全页等待验证器开关，与整行任务共享剩余时间；未确认开关时不能修改其他安全设置。
-    await clickAndConfirm(securityPage, 'Security and login', {
-      region: 'left', timeoutMilliseconds: 10000, stabilityMilliseconds: 600,
-    }, async () => ['enabled', 'disabled'].includes((await read()).stage), 10000,
-    'Security and login 未显示 Authenticator app');
+      `(${inspectAuthenticator.toString()})(${JSON.stringify(action)})`, false, 3000)
+      .catch(() => action === 'secret' ? '' : ({stage:'unavailable'}));
+    if (!resumable.includes((await read()).stage)) {
+      onStep('打开 Security and login');
+      // 安全页等待验证器开关，与整行任务共享剩余时间；未确认开关时不能修改其他安全设置。
+      await clickAndConfirm(securityPage, 'Security and login', {
+        region: 'left', timeoutMilliseconds: 10000, stabilityMilliseconds: 600,
+      }, async () => resumable.includes((await read()).stage), 10000,
+      'Security and login 未显示 Authenticator app');
+    }
     return await configureAuthenticator({
       read, now: Date.now, sleep, onStep, isActive: context.isActive,
       click: point => mouseClick(securityPage, point),
@@ -1676,7 +1741,18 @@ async function configureAccountTwoFactor(page, context, onStep, onProgress) {
         await typeWithKeyboard(securityPage, code, { intervalMilliseconds: 100 });
         await dispatchKey(securityPage, 'Tab', 'Tab', 9);
       },
-    }, onProgress);
+      typePassword: async password => {
+        // 仅在官方密码框逐字符输入现有密码，Tab 后精确核对；失败不输出密码或页面原文。
+        const inputState = () => evaluate(securityPage, `(${inspectLoginInput.toString()})('password', ${JSON.stringify(password)})`, false);
+        const before = await inputState();
+        if (!before?.focused) throw new Error('密码输入框未就绪');
+        if (before.accepted) return;
+        await clearFocusedField(securityPage, before.length);
+        await typeWithKeyboard(securityPage, password, {intervalMilliseconds:100});
+        await dispatchKey(securityPage, 'Tab', 'Tab', 9);
+        if (!(await inputState())?.accepted) throw new Error('密码输入未被页面接受');
+      },
+    }, onProgress, {verificationPassword:context.verificationPassword});
   } catch {
     // 安全页可能包含 Key 或验证码，禁止传播原始页面异常到日志。
     return { twoFactorStatus: 'failed', twoFactorError: '无法完成 2FA 安全设置，请检查当前账号页面' };
@@ -2043,7 +2119,7 @@ async function runPostPurchaseActions(page, profile, row, proofContext, onStep, 
 
 const additionalFields = {screenshot:['screenshotUrl','screenshotError','screenshotStatus'], invoice:['invoiceFileName','invoiceError','invoiceStatus'], cpa:['cpaJson','cpaError','cpaStatus'], '2fa':['twoFactorKey','twoFactorError','twoFactorStatus']};
 
-export async function runAdditionalJob({jobId, row, option, options, paymentConfirmed = false, apiBase, apiKey, onEvent = () => {}, registerRowControl = () => {}}) {
+export async function runAdditionalJob({jobId, row, option, options, paymentConfirmed = false, apiBase, apiKey, verificationPassword = '', onEvent = () => {}, registerRowControl = () => {}}) {
   const selectedOptions=resolveAdditionalOptions(options ?? [option]);
   if(!selectedOptions.length)throw new Error('至少选择一个附加功能');
   const label=selectedOptions.join(' + ');
@@ -2081,7 +2157,7 @@ export async function runAdditionalJob({jobId, row, option, options, paymentConf
     await page.command('Page.enable');
     await page.command('Runtime.enable');
     return runPostPurchaseActions(page, profile, row, {
-      jobId, index, additionalOptions:selectedOptions, isActive:() => active && Date.now() < deadline,
+      jobId, index, verificationPassword, additionalOptions:selectedOptions, isActive:() => active && Date.now() < deadline,
       onPostPurchaseProgress: patch => {
         if (!active) return;
         result = {...result, ...patch};
@@ -2185,6 +2261,7 @@ export async function runUpgradeJob({
   rechargeType = 'ads',
   apiBase,
   apiKey,
+  verificationPassword = '',
   onEvent = () => {},
   shouldStop = () => false,
   registerRowControl = () => {},
@@ -2234,7 +2311,7 @@ export async function runUpgradeJob({
         if (!active) return;
         currentStep = step;
         emit({ type: 'step_started', index: uiIndex, message: `${prefix}：${step}` });
-      }, { jobId, index: uiIndex, rechargeType, additionalOptions: selectedOptions,
+      }, { jobId, index: uiIndex, rechargeType, verificationPassword, additionalOptions: selectedOptions,
         isActive: () => active && Date.now() < deadline,
         onPaymentSubmitted: () => { if (active) paymentSubmitted = true; },
         onPaymentConfirmed: () => {

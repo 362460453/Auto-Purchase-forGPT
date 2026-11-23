@@ -38,6 +38,27 @@ function uiFixture() {
   return {context, elements, reads, handlers, download:() => downloaded};
 }
 
+test('验证密码由本地设置保存，只传给 2FA，不写入结果 CSV，保留已有配置', async () => {
+  const {context, handlers, elements} = uiFixture();
+  let saved;
+  context.localStorage = {getItem:()=>JSON.stringify({custom:'keep'}), setItem:(_key,value)=>{saved=JSON.parse(value);}};
+  vm.runInContext("loadSettingsForm(); $('#settings-dialog').close=()=>{}; $('#verification-password').value=' fixture-password ';", context);
+  handlers.get('#settings-form:submit')({preventDefault(){}});
+  assert.equal(saved.verificationPassword, ' fixture-password ');
+  assert.equal(saved.custom, 'keep');
+  let posted;
+  context.fetch = async (_url,init) => {posted=JSON.parse(init.body);return{ok:true,json:async()=>({jobId:'fixture',resultToken:'token'})};};
+  vm.runInContext("rows=[{adsPowerSerialNumber:'fixture',email:'fixture@example.invalid'}];rowStates.push({});",context);
+  await vm.runInContext("startAdditional(0,'2fa')",context);
+  assert.equal(posted.verificationPassword,' fixture-password ');
+  assert.equal('password' in posted.row,false);
+  assert.ok(!vm.runInContext('buildResultsCsv(rows,rowStates)',context).includes('fixture-password'));
+  vm.runInContext('jobRunning=false',context);
+  await vm.runInContext("startAdditional(0,'cpa')",context);
+  assert.equal('verificationPassword' in posted,false);
+  assert.ok(!(elements.get('#events')?.children || []).some(item=>item.textContent.includes('fixture-password')));
+});
+
 test('AdsPower 五列模板可直接导入，旧模板按表头忽略密码且不造成银行卡错位', async () => {
   const {context, handlers, download, elements} = uiFixture();
   handlers.get('#download-template:click')({preventDefault(){}});

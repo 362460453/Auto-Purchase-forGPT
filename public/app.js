@@ -22,6 +22,7 @@ const stored = storedSettings();
 const settings = {
   apiBase: stored.apiBase || defaultSettings.apiBase,
   apiKey: typeof stored.apiKey === 'string' ? stored.apiKey : defaultSettings.apiKey,
+  verificationPassword: typeof stored.verificationPassword === 'string' ? stored.verificationPassword : '',
 };
 // 用户提供的 OR 地址按整条维护；街道、城市、州、邮编不得拆开随机组合。
 const OR_BILLING_ADDRESSES = Object.freeze([
@@ -236,14 +237,16 @@ function renderRows() {
   $('#task-table-wrap').classList.toggle('scrollable', rows.length > 10);
   $('#task-list').hidden = rows.length===0; $('#start').disabled = jobRunning || !hasExecutionSelection() || rows.length === 0 || !rows.some((_, index) => canRetryRow(index)); $('#retry-failed').disabled = jobRunning || retryIndexes().length === 0; $('#stop-all').disabled = !jobRunning || stopRequested;
 }
-function loadSettingsForm() { $('#adspower-api-base').value = settings.apiBase; $('#adspower-api-key').value = settings.apiKey; }
+function loadSettingsForm() { $('#adspower-api-base').value = settings.apiBase; $('#adspower-api-key').value = settings.apiKey; $('#verification-password').value = settings.verificationPassword; }
 $('#settings-open').addEventListener('click', () => { loadSettingsForm(); $('#settings-dialog').showModal(); });
 $('#settings-cancel').addEventListener('click', () => $('#settings-dialog').close());
 $('#settings-form').addEventListener('submit', (event) => {
   event.preventDefault();
   settings.apiBase = $('#adspower-api-base').value.trim().replace(/\/$/, '');
   settings.apiKey = $('#adspower-api-key').value.trim();
-  localStorage.setItem('gpt-upgrade-settings', JSON.stringify({ apiBase: settings.apiBase, apiKey: settings.apiKey }));
+  // 现有密码由用户在本地设置，不写进源码或 CSV；保留空格，避免改变用户的实际密码。
+  settings.verificationPassword = $('#verification-password').value;
+  localStorage.setItem('gpt-upgrade-settings', JSON.stringify({...storedSettings(), ...settings}));
   $('#settings-dialog').close();
   $('#activity').textContent = 'AdsPower 设置已保存';
 });
@@ -570,7 +573,8 @@ async function startAdditional(index, option) {
   try {
     const response = await fetch('/api/jobs/additional', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({option, row:{adsPowerSerialNumber:row.adsPowerSerialNumber, email:row.email, __uiIndex:index},
-        apiBase:settings.apiBase, apiKey:settings.apiKey})});
+        apiBase:settings.apiBase, apiKey:settings.apiKey,
+        ...(option==='2fa'?{verificationPassword:settings.verificationPassword}:{})})});
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || '附加任务启动失败');
     activeResultAccess = {jobId:body.jobId, resultToken:body.resultToken};
@@ -602,6 +606,7 @@ async function startJob(taskRows) {
   // 只执行附加功能时不传卡资料或 Billing 地址，后台也再次剔除；不把所选充值金额当成已订阅套餐。
   const input={rows:purchase?taskRows:taskRows.map(row=>({adsPowerSerialNumber:row.adsPowerSerialNumber,email:row.email,__uiIndex:row.__uiIndex})),
     purchase,concurrency:Number($('#concurrency').value),rechargeType,additionalOptions,apiBase:settings.apiBase,apiKey:settings.apiKey,
+    ...(rechargeType==='ads'&&additionalOptions.includes('2fa')?{verificationPassword:settings.verificationPassword}:{}),
     ...(purchase?{product:$('#product').value,...selectedPlan()}:{})};
   jobRunning = true;
   stopRequested = false;

@@ -155,25 +155,75 @@ test('CSV 的 2fa 是本次保存的 Key，未确认状态明确；忽略导入�
   assert.ok(!csv.includes('UNTRUSTED'));
 });
 
-function domFixture({ selected = true, secrets = [fixtureKey], input = false, origin = 'https://chatgpt.com' } = {}) {
+function domFixture({ selected = true, secrets = [fixtureKey], input = false, inline = false, origin = 'https://chatgpt.com' } = {}) {
   const node = (text, attrs = {}) => ({
     innerText:text, textContent:text, children:[], tagName:'SPAN',
     getAttribute:name => attrs[name] ?? null,
     getBoundingClientRect:() => ({left:20, top:30, width:100, height:30}),
   });
   const key = node('Key', {'aria-pressed':String(selected)});
-  const code = {...node(''), tagName:'INPUT', placeholder:'000000', value:'', maxLength:-1};
+  const manual = node(selected ? 'Show QR code' : 'Can’t scan? Enter the code manually');
+  const verify = node('Verify');
+  const code = {...node('', inline ? {'aria-label':'6-digit code'} : {}), tagName:'INPUT', placeholder:inline ? '' : '000000', value:'', maxLength:-1};
   const panel = {...node(''), querySelectorAll:() => secrets.map(value => node(value))};
   const dialog = {...node(input ? 'Enter the 6-digit code shown in your authenticator app to finish setup' : 'Copy and paste the setup key into your authenticator app'),
     contains:() => false,
-    querySelectorAll:selector => selector === 'input' ? input ? [code] : []
+    querySelectorAll:selector => selector === 'input' ? input || inline ? [code] : []
       : selector.includes('role="tabpanel"') ? [panel]
-      : selector.includes('role="alert"') ? [] : input ? [] : [key],
+      : selector.includes('role="alert"') ? [] : inline ? [manual, verify] : input ? [] : [key],
   };
   return {location:{origin}, innerWidth:1000, innerHeight:800, getComputedStyle:() => ({visibility:'visible'}),
     document:{querySelectorAll:selector => selector.includes('role="dialog"') ? [dialog] : [], getElementById:() => null}};
 }
 const inspect = (action, fixture) => vm.runInNewContext(`(${inspectAuthenticator.toString()})(${JSON.stringify(action)})`, fixture);
+test('14626 官方邮箱二次验证只返回等待状态，不读取页面秘密', () => {
+  const fixture = domFixture({origin:'https://auth.openai.com'});
+  fixture.location.pathname = '/email-verification';
+  assert.equal(inspect('state', fixture).stage, 'verification_required');
+  assert.equal(inspect('secret', fixture), '');
+  assert.equal(inspect('state', {location:{origin:'https://example.invalid', pathname:'/email-verification'}}).stage, 'unavailable');
+});
+
+test('开关后的人工邮箱验证共享总时限，返回不同设置状态时继续且只提示一次', async () => {
+  for (const returnStage of ['disabled', 'intro', 'setup', 'enabled', 'never']) {
+    const fixture = driverFixture();
+    const read = fixture.driver.read;
+    const click = fixture.driver.click;
+    let verificationAt = null;
+    let resumed = false;
+    let toggles = 0;
+    fixture.driver.click = async point => {
+      await click(point);
+      if (point.action === 'toggle' && ++toggles === 1) verificationAt = fixture.driver.now();
+    };
+    fixture.driver.read = async action => {
+      if (verificationAt !== null) {
+        if (returnStage === 'never' || fixture.driver.now() - verificationAt < 20000) {
+          return {stage:'verification_required'};
+        }
+        if (!resumed) {
+          resumed = true;
+          verificationAt = null;
+          if (returnStage === 'setup') await click({action:'continue'});
+          const state = await read(action);
+          return {...state, stage:returnStage};
+        }
+      }
+      return read(action);
+    };
+    const result = await configureAuthenticator(fixture.driver, fixture.onProgress);
+    assert.equal(fixture.actions.filter(message => message.includes('请在当前 AdsPower')).length, 1);
+    assert.equal(result.twoFactorStatus, returnStage === 'never' ? 'failed' : returnStage === 'enabled' ? 'already_enabled' : 'completed');
+    assert.equal(toggles, returnStage === 'disabled' ? 2 : 1);
+    assert.equal(result.twoFactorKey, ['never', 'enabled'].includes(returnStage) ? '' : fixtureKey);
+    if (returnStage === 'never') {
+      assert.match(result.twoFactorError, /人工邮箱验证/);
+      assert.ok(!fixture.actions.includes('input'));
+      assert.ok(fixture.driver.now() >= 600000);
+    }
+  }
+});
+
 test('真实 Key 切换按钮和 Code 占位符识别；状态不带 Key，歧义/未选中/非官方页面不读 Key', () => {
   assert.equal(inspect('secret', domFixture()), fixtureKey);
   assert.equal(inspect('state', domFixture()).keySelected, true);
@@ -182,4 +232,78 @@ test('真实 Key 切换按钮和 Code 占位符识别；状态不带 Key，歧�
   assert.equal(inspect('secret', domFixture({secrets:[fixtureKey, 'JBSWY3DPEHPK3PXP']})), '');
   assert.equal(inspect('state', domFixture({input:true})).stage, 'verify');
   assert.equal(inspect('state', domFixture({origin:'https://example.invalid'})).stage, 'unavailable');
+});
+
+test('新版同页密钥与验证码：展开手动 Key、保留 Key、仅点击一次 Verify', async () => {
+  for (const selected of [true, false]) {
+    const dom = domFixture({inline:true, selected});
+    const state = inspect('state', dom);
+    assert.equal(state.stage, 'setup');
+    assert.equal(state.inlineSetup, true);
+    assert.equal(state.keySelected, selected);
+    assert.equal(inspect('secret', dom), selected ? fixtureKey : '');
+    assert.ok(inspect('input', dom).point);
+    assert.ok(inspect('continue', dom).point);
+  }
+  const fixture = driverFixture();
+  const read = fixture.driver.read;
+  const click = fixture.driver.click;
+  let opened = false;
+  fixture.driver.click = async point => {
+    if (point.action === 'toggle') {opened = true; await click(point); await click({action:'continue'}); return;}
+    if (point.action === 'continue') {await click(point); await click(point); return;}
+    await click(point);
+  };
+  fixture.driver.read = async action => {
+    const state = await read(action);
+    return opened && state.stage === 'setup' ? {...state, inlineSetup:true} : state;
+  };
+  const result = await configureAuthenticator(fixture.driver, fixture.onProgress);
+  assert.equal(result.twoFactorStatus, 'completed');
+  assert.equal(result.twoFactorKey, fixtureKey);
+  assert.ok(fixture.actions.indexOf('key') < fixture.actions.indexOf('input'));
+  assert.equal(fixture.progress[0].twoFactorStatus, 'pending');
+});
+
+test('二次验证用已设置的密码，只提交一次；拒绝或异常不泄密，不提交验证码', async () => {
+  for (const failure of ['', 'rejected', 'type']) {
+    const fixture = driverFixture();
+    const read = fixture.driver.read;
+    const click = fixture.driver.click;
+    let auth = '', invalid = false, submitted = 0, typed = 0;
+    fixture.driver.read = async action => auth ? {stage:auth, invalid, point:{x:10,y:10,action}, viewport:{width:100,height:100}} : read(action);
+    fixture.driver.click = async point => {
+      if (point.action === 'password-method') {auth = 'password_required'; return;}
+      if (point.action === 'password-input') return;
+      if (point.action === 'password-continue') {submitted++; if (failure === 'rejected') invalid = true; else auth = ''; return;}
+      await click(point);
+      if (point.action === 'toggle') auth = 'verification_required';
+    };
+    fixture.driver.typePassword = async value => {
+      assert.equal(value, 'fixture-password'); typed++;
+      if (failure === 'type') throw Error(value);
+    };
+    const result = await configureAuthenticator(fixture.driver, fixture.onProgress, {verificationPassword:'fixture-password'});
+    assert.equal(result.twoFactorStatus, failure ? 'failed' : 'completed');
+    assert.equal(typed, 1);
+    assert.equal(submitted, failure === 'type' ? 0 : 1);
+    assert.ok(!JSON.stringify([result, fixture.actions, fixture.progress]).includes('fixture-password'));
+    if (failure) assert.ok(!fixture.actions.includes('input'));
+  }
+});
+
+test('启用后跳过可选短信备份，仍须等开关开启；只跳过一次，不添加手机号', async () => {
+  const fixture = driverFixture();
+  const read=fixture.driver.read, click=fixture.driver.click;
+  let backup=false, skipped=0;
+  fixture.driver.read=async action=>backup?{stage:'backup_prompt',point:{x:10,y:10,action},viewport:{width:100,height:100}}:read(action);
+  fixture.driver.click=async point=>{
+    if(point.action==='skip-backup'){skipped++;backup=false;return;}
+    const before=await read();
+    await click(point);
+    if(point.action==='continue'&&before.stage==='verify')backup=true;
+  };
+  const result=await configureAuthenticator(fixture.driver,fixture.onProgress);
+  assert.equal(result.twoFactorStatus,'completed');assert.equal(skipped,1);
+  assert.equal(result.twoFactorKey,fixtureKey);
 });

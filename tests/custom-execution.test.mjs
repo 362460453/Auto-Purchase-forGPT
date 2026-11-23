@@ -68,4 +68,12 @@ test('HTTP 明确区分充值与附加执行，默认兼容旧客户端；附加
  c.markPaid('paid');assert.equal((await request({rows:[{...row,adsPowerSerialNumber:'paid'}],purchase:true,additionalOptions:[]})).code,400);
  assert.equal((await request({rows:[{...row,adsPowerSerialNumber:'paid'}],purchase:false,additionalOptions:['screenshot']})).code,202);
  assert.equal((await request({row,option:'screenshot'},'/api/jobs/additional')).code,202);assert.equal(calls.at(-1).input.paymentConfirmed,false);
+ for(const mode of ['single','additional','purchase']){
+  const input=mode==='single'?{row,option:'2fa'}:{rows:[row],purchase:mode==='purchase',additionalOptions:['2fa']};
+  assert.equal((await request({...input,verificationPassword:'fixture-password'},mode==='single'?'/api/jobs/additional':'/api/jobs')).code,202);
+  assert.equal(calls.at(-1).input.verificationPassword,'fixture-password');
+ }
+ assert.equal((await request({row,option:'screenshot',verificationPassword:'fixture-password'},'/api/jobs/additional')).code,202);
+ assert.equal(calls.at(-1).input.verificationPassword,'');
+ assert.equal((await request({row,option:'2fa',verificationPassword:{}},'/api/jobs/additional')).code,400);
 });
