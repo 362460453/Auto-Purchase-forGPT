@@ -18,15 +18,28 @@ adsPowerSerialNumber,email,cardNumber,expires_at,cvv
 
 AdsPower CSV 使用上述五列，不需要密码。旧模板仍可导入，但 password 列会被忽略，不进入任务或请求。暂停开发的无痕模式保留原有密码及 mailAccess 格式。页面提供“Billing 地址州”下拉框，默认 `Oregon / 俄勒冈州`。OR 地址池在 `public/app.js` 的 `OR_BILLING_ADDRESSES` 中维护，按用户原表保存 23 条街道、城市、州和邮编组合。导入 CSV 时，每条任务随机抽取一整条地址（允许重复），并在 CVV 后面的“Billing 地址”列展示；姓名沿用现有随机生成方式。任务重试复用首次导入时绑定的地址，不会临时更换。新地址池在刷新控制台后新导入的任务中生效，已导入行不自动替换；地址数据尚未验证实际有效性。
 
-## 启动
+## 启动与分发
 
-macOS：
+不用复制整个项目，按系统发送启动文件即可：
 
-```bash
-./start-local.sh
-```
+- **Windows**：发送 `start-windows.bat` 和 `start-windows.ps1`，放在同一文件夹，双击 BAT。PowerShell 文件保留 UTF-8 BOM，支持 Windows PowerShell 5.1。
+- **Mac**：只发送 `start-mac.command`，双击运行，支持 Apple Silicon 和 Intel。建议发送启动文件 ZIP，解压后运行，以保留可执行权限。
 
-Windows：把 `start-local.bat` 单独拷到电脑上双击即可，不必同时拷 `start-local.ps1`。没有 Git / Node.js 会自动安装；没有项目会克隆到用户目录；每次启动默认拉最新代码。启动后请手动打开 `http://127.0.0.1:4173`，脚本不会自动弹浏览器。
+两个系统使用相同流程：检查 Node.js 22+ 和 Git → 没有项目则从 GitHub 的 main 下载 → 已有项目则快进更新 main → 启动本地服务。首次下载到用户目录下的 `Auto-Purchase-forGPT`；启动文件放在本项目目录时优先使用当前项目，所以开发机也使用同一入口。也可用环境变量 `GPT_UPGRADE_PROJECT_DIR` 指定项目目录。
+
+Windows 缺少 Git 或合适的 Node.js 时通过 winget 安装，需完成系统安装提示；系统没有 winget 时先安装 Microsoft 的 App Installer。Mac 缺少 Node.js 时自动从 nodejs.org 下载适配处理器的 Node.js 22 LTS，校验 SHA256 后存入本工具的用户缓存，无需 Homebrew 或管理员权限；缺少 Git 时调起苹果 Command Line Tools 安装，安装完成后继续。依赖安装需要联网，系统安装提示需要用户操作。
+
+本地有未提交修改或不在 main 分支时，保留当前代码并运行，明确提示未更新；分支分歧或网络更新失败同样保留本地版本。不会强制切分支或 `reset --hard`，不会删除日志或本地配置。首次下载失败不留下半成品目录。若端口已占用，会在更新前停止，避免重复双击打断原来正在执行的任务；请使用已打开的服务，或者先结束旧服务再启动更新。
+
+当前 GitHub 仓库匿名访问不可用，新电脑需要有仓库访问权限的 GitHub 账号，并完成 Git 的登录提示。脚本不包含个人 token；已有 Git 凭据会复用，未授权电脑不能仅靠启动文件读取私有代码。
+
+启动后手动访问 `http://127.0.0.1:4173`，不自动打开浏览器。保持启动窗口打开，按 Ctrl+C 停止。新电脑需另行安装并登录 AdsPower，开启 Local API，再在控制台“设置”填写该电脑的地址和 API-Key。
+
+仓库内原命令 `./start-local.sh` 和旧 Windows 入口仍兼容，会转到新的系统入口；给其他电脑分发时使用上面带系统名称的文件。Mac 文件若被传输工具去掉执行权限，可在终端运行 `chmod +x /实际路径/start-mac.command` 后再双击。
+
+启动器集成回归：`node --test tests/launchers.test.mjs`，使用临时 Git 仓库检查首次下载、快进更新、本地改动保护、断网降级、端口占用和错误退出。Mac 流程在 macOS 运行；Windows PowerShell 逻辑需本机有 `pwsh`（也可通过 `POWERSHELL_BIN` 指定），没有时会明确跳过，不代表 Windows 实机通过。
+
+2026-11-23：语法检查和 104 项回归通过（包含 14 项启动器测试，无跳过）。Mac 单独分发文件已在本机完成从 GitHub 下载到临时项目、启动真实服务及 HTTP 200 验证；Windows 脚本使用 macOS 上的 PowerShell 7 Legacy 参数模式执行测试，依赖安装用桩模拟，尚未在 Windows 电脑上实测。
 
 AdsPower Local API 默认地址是 `http://127.0.0.1:50325`。启动后，每条任务会：
 

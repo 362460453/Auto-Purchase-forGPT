@@ -5,3 +5,6 @@ node_modules/
 data/
 .idea
 
+
+# 可重新生成的轻量启动器分发包。
+launcher-packages/
