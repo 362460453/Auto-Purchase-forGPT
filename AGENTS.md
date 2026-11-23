@@ -16,7 +16,7 @@
 - 不实现团队版，不把其他产品强行套用到 Pro 的流程。
 - 登录出现邮箱验证码、MFA、CAPTCHA 或风控时，只提示用户在 AdsPower 窗口中人工完成，不绕过验证。
 
-- 时间规则（2026-11-22 最新要求）：一条任务总共 10 分钟，各小阶段不额外设置结束时限。截图、CPA、2FA 和人工登录等待全部共享任务开始时的同一个截止时间；明确的拒付、手机号要求和页面错误仍立即处理。
+- 时间规则（2026-11-22 最新要求）：一条任务总共 10 分钟，各小阶段不额外设置结束时限。截图、下载发票、CPA、2FA 和人工登录等待全部共享任务开始时的同一个截止时间；明确的拒付、手机号要求和页面错误仍立即处理。
 
 ## 2. 技术结构（用 Java 分层类比）
 
@@ -29,6 +29,7 @@
 | `src/automation/two-factor.mjs` / `totp.mjs` | 2FA 设置状态机、本机 TOTP | 安全附加任务 |
 | `src/job-results.mjs` | 凭批次令牌读取内存中的 CPA JSON / Key，剔除广播秘密字段 | 私有任务结果 |
 | `src/automation/codex-oauth.mjs` / `codex-driver.mjs` | Codex PKCE 授权、CDP 回调截获、同 Profile 兑换与 JSON 生成 | CPA 附加任务 |
+| `src/automation/invoice.mjs` | 最新交易识别、真实浏览器下载与本地 PDF 校验 | 发票附加任务 |
 | `src/automation/pro-plans.mjs` | Pro 金额契约、卡片识别、结账金额读取 | 套餐规则 |
 | `src/automation/gpt-upgrade.mjs` | GPT 升级状态机、CDP 鼠标键盘、Stripe 表单 | Service |
 | `src/automation/adspower.mjs` | AdsPower Local API 启停 Profile | 外部 API Client |
@@ -108,7 +109,7 @@ Billing 地址规则：
 - `product`：当前只能是 `Pro`。
 - AdsPower 使用 `planAmount`：`"100"`、`"200"`、`"500"`（也接受同值数字），默认 `"200"`。HTTP 接口在启动任务前校验。
 - 未刷新的旧客户端仍可传 `multiplier`：`20x` 映射 `200`，`5x` 映射 `100`；新客户端不再用倍率表示 AdsPower 规格。无痕模式仍传原有 `multiplier`。
-- `additionalOptions`：数组，可选 `screenshot`、`cpa`、`2fa`；CPA / 2FA 仅支持 AdsPower。空数组不执行附加任务，缺省兼容旧客户端默认截图。顺序固定为截图 → CPA → 2FA，未勾选的步骤不执行。
+- `additionalOptions`：数组，可选 `screenshot`、`invoice`、`cpa`、`2fa`；发票 / CPA / 2FA 仅支持 AdsPower。空数组不执行附加任务，缺省兼容旧客户端默认截图。顺序固定为截图 → 下载发票 → CPA → 2FA，未勾选的步骤不执行。
 - `apiBase`、`apiKey`：AdsPower 设置。
 
 接口校验后立即返回 HTTP 202、`jobId` 和仅当前页面保存的 `resultToken`，任务在后台运行。不要把整条自动化阻塞在 HTTP 请求上。
@@ -214,7 +215,7 @@ Stripe 的银行卡和 Billing 地址位于独立 iframe Target，不在 ChatGPT
 ## 9. 异常、并发和重试
 
 - 每条任务维护 `currentStep`。任何异常都要形成“当前步骤失败：具体原因”。
-- 每条任务从开始执行起一共最多 10 分钟，浏览器启动、登录、选套餐、支付、截图、CPA 和 2FA 共用一次截止时间。各小阶段不另设业务超时，不重置计时。超时立即关闭该条 AdsPower Profile，按当前步骤发送 `row_failed`，并释放并发空位；其他正在执行的任务不受影响。Subscribe 点击后页面转圈也算在这 10 分钟内。
+- 每条任务从开始执行起一共最多 10 分钟，浏览器启动、登录、选套餐、支付、截图、下载发票、CPA 和 2FA 共用一次截止时间。各小阶段不另设业务超时，不重置计时。超时立即关闭该条 AdsPower Profile，按当前步骤发送 `row_failed`，并释放并发空位；其他正在执行的任务不受影响。Subscribe 点击后页面转圈也算在这 10 分钟内。
 - 一条任务失败后，立即停止并关闭该条 AdsPower Profile，发送 `row_failed`；其他并发任务继续执行。
 - `runWithConcurrency` 使用共享游标组成固定大小的执行池，并发限制 1-10。并发为 5 时先同时领取列表前 5 条；任意一条完成或失败后，立刻按列表顺序领取下一条，始终保持同时执行数为设定并发（剩余任务不足时自然减少）。结果仍按输入顺序保存。一条失败只关闭该条 Profile，不减少其他空位、不中断其他正在执行的任务。
 - 页面“终止所有任务”只停止领取排队项：正在执行的任务继续跑完，尚未开始的任务标记为 `已取消`，不进入失败重试列表。
@@ -329,7 +330,7 @@ AdsPower 启动
 
 ## 18. 独立附加任务与付款保护
 
-- 每次任务从开始执行起一共 10 分钟，包含浏览器启动。购买任务内的截图 → CPA → 2FA 与购买过程共用原截止时间，不增加任何附加时长。用户单独发起一个附加任务时，该次任务也只建立一次 10 分钟截止时间，内部小阶段同样共享。
+- 每次任务从开始执行起一共 10 分钟，包含浏览器启动。购买任务内的截图 → 下载发票 → CPA → 2FA 与购买过程共用原截止时间，不增加任何附加时长。用户单独发起一个附加任务时，该次任务也只建立一次 10 分钟截止时间，内部小阶段同样共享。
 - `runAdditionalJob` 与购买服务分离，仅调用共用附加动作。`POST /api/jobs/additional` 每次只接收一个 `option` 和 Profile/账号/行号，不传银行卡及地址，不进入充值状态机。
 - 服务从完整本地日志恢复已付款 Profile（兼容旧 `row_succeeded` 及新 `row_payment_confirmed`），`GET /api/paid-profiles` 用于导入时恢复付款状态和套餐。已有付款记录禁止再走购买接口；同一 Profile 跨批次互斥。付款记录按 Profile 编号匹配，不能用于换绑其他账号后的重复购买。
 - 已付款行始终禁用充值重试；操作列单独提供截图、CPA、2FA。独立执行发 `additional_started` / `additional_progress` / `additional_finished`，只更新当前项字段，失败不进入充值失败列表。
@@ -341,3 +342,13 @@ AdsPower 启动
 - 2026-11-22 12:37（本地时间）已在 AdsPower 14622 实机完成独立 CPA：精确匹配已登录账号 → 点击账号（第一次点击未生效，8 秒后局部补点一次）→ 有效回调 → 官方同源兑换 → 凭据完整且邮箱匹配 → 任务行显示已导出并关闭 Profile。付款及已有截图保留；没有重新充值。新版账号按钮匹配必须同时读取标签和子节点邮箱，排除 Remove account；不能只要求 aria-label 前缀。
 
 2026-11-22 在 AdsPower 14621 实机定位到相同 Pro 三档卡片使用 Upgrade to Pro，而非 Buy now。旧识别只接受 Buy now，导致卡片已出现仍误报超时；现兼容卡片内唯一的两种购买文案，并保留金额和选中状态校验。已将修正后的生产识别函数直接用于该页面，返回 amount=200、selected=true、button=Upgrade to Pro；随后实机选择 $200 并点击该按钮，确认 ChatGPT Pro / Due today $200.00。验证止于结账，未填写卡资料、未提交扣款；未运行整条充值任务。
+
+## 19. 下载发票
+
+- AdsPower 新增 `invoice` 附加选项，默认不选；自动顺序截图 → 下载发票 → CPA → 2FA。已付款行提供下载发票单项入口。购买内附加与原任务共用 10 分钟；独立发起时该次任务也只建立一个 10 分钟截止时间。
+- 在 Billing 的 `table[aria-label="Transaction history"]` 按 Date 列选最新记录，只点该行唯一 `a[aria-label^="Open invoice"]`。不用 Expense this，不借用其他交易/已有发票标签。真实鼠标滚动到内容视区，坐标稳定后点击。
+- 新页面必须是当前交易对应的 `invoice.stripe.com`。真实鼠标点唯一 Download invoice，忽略 Download receipt；Browser 下载事件须来自当前发票 frame，并确认 completed；校验 `%PDF-` 与 `%%EOF` 后才成功。新标签及下载临时目录结束时清理，原有标签保留。
+- PDF 写入 `data/invoices/` 并本地保留，不随服务关闭删除；不进 Git。临时下载只用本次独立目录，失败/终止不删除其他行或已完成文件。
+- `invoiceFileName` 仅由批次令牌接口读取，SSE 提供可用性，日志不保存文件名/路径、发票 URL、PDF 或 Billing 资料。发票接口 `GET /api/jobs/:jobId/invoices/:index` 必须 Bearer 验证并精确对应行号，Cache-Control no-store。
+- 发票失败只更新 invoiceStatus/invoiceError，保留已付款与其他附加结果，不进入充值重试。新失败的空结果不擦掉旧发票；前端按文件来源批次保存。CSV 仅增加发票状态。
+- 2026-11-23 在 14651 实机验证最新交易 → 新发票标签 → Download invoice → completed → 37,676 字节完整 PDF；未充值、未下载 receipt。

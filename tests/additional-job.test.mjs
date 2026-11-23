@@ -27,8 +27,8 @@ test('付款记录只接受明确支付成功，兼容旧日志且不限展示�
   assert.equal(paid.has('b'),true);assert.equal(paid.list()[0].subscriptionType,'Pro / $200 / 月');
 });
 
-test('三个附加入口不调用付款，不需卡资料，只返回本项；超时保留已取得 Key',async()=>{
-  for(const option of ['screenshot','cpa','2fa']){
+test('四个附加入口不调用付款，不需卡资料，只返回本项；超时保留已取得 Key',async()=>{
+  for(const option of ['screenshot','invoice','cpa','2fa']){
     const events=[];let stops=0,closes=0,delay;
     const context=vm.createContext({AsyncLocalStorage, AbortController,initialPostPurchaseResult,interruptedPostPurchaseResult,
       setTimeout:(fn,ms)=>{delay=ms;return setTimeout(fn,25);},clearTimeout,
@@ -39,7 +39,7 @@ test('三个附加入口不调用付款，不需卡资料，只返回本项；�
     context.runPostPurchaseActions=async(_page,_profile,_row,proof)=>{
       assert.deepEqual([...proof.additionalOptions],[option]);
       if(option==='2fa') {proof.onPostPurchaseProgress({twoFactorKey:'fixture-key'});return new Promise(()=>{});}
-      return {...initialPostPurchaseResult([option]),...(option==='screenshot'?{screenshotStatus:'completed',screenshotUrl:'/test.png'}:{cpaStatus:'failed',cpaError:'手机号要求'})};
+      return {...initialPostPurchaseResult([option]),...(option==='screenshot'?{screenshotStatus:'completed',screenshotUrl:'/test.png'}:option==='invoice'?{invoiceStatus:'completed',invoiceFileName:'fixture.pdf'}:{cpaStatus:'failed',cpaError:'手机号要求'})};
     };
     const result=await context.runAdditionalJob({jobId:'fixture',row:{adsPowerSerialNumber:'paid',email:'fixture@example.invalid',__uiIndex:2},option,onEvent:event=>events.push(event)});
     assert.equal(delay,600000);assert.ok(stops>=1);assert.equal(closes,1);

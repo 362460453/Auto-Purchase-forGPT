@@ -12,9 +12,9 @@ export function createJobResults() {
       const job = jobs.get(event.jobId);
       // 两种秘密分别合并，后续附加项状态更新不能清掉已取得的另一种结果。
       const sanitize = item => {
-        const { twoFactorKey, cpaJson, ...safe } = item;
+        const { twoFactorKey, cpaJson, invoiceFileName, ...safe } = item;
         const secrets = {};
-        for (const [field, value] of Object.entries({twoFactorKey, cpaJson})) {
+        for (const [field, value] of Object.entries({twoFactorKey, cpaJson, invoiceFileName})) {
           if (typeof value !== 'string') continue;
           safe[`${field}Available`] = Boolean(value);
           secrets[field] = value;

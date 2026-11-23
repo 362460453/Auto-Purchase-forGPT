@@ -179,7 +179,7 @@ test('CPA 与 Key 分别合并、批次隔离、SSE 剔除，CSV JSON 引号可�
   const records = vm.runInNewContext(`${parser}; parseCsv(csv)`, {csv});
   assert.equal(records[1][3], json);
   assert.equal(records[1][4], 'fixture-key');
-  assert.equal(records[1].at(-1), '已导出');
+  assert.equal(records[1][records[0].indexOf('CPA状态')], '已导出');
 });
 
 test('CDP 驱动先监听再导航，回调本地拦截，兑换沿用 Profile 同源，关闭只影响自建标签', async () => {

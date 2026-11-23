@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
-import { buildResultsCsv, twoFactorStatusText, cpaStatusText } from '../public/task-export.js';
+import { buildResultsCsv, twoFactorStatusText, cpaStatusText, invoiceStatusText } from '../public/task-export.js';
 
 const source = (await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/^import .*;\n/gm, '');
 function uiFixture() {
@@ -21,7 +21,7 @@ function uiFixture() {
   const options = [{name:'additionalOptions', value:'2fa', checked:true}];
   const reads = [];
   const context = vm.createContext({
-    buildResultsCsv, twoFactorStatusText, cpaStatusText, console, setTimeout, Blob,
+    buildResultsCsv, twoFactorStatusText, cpaStatusText, invoiceStatusText, console, setTimeout, Blob,
     URL:{createObjectURL:blob => {downloaded = blob; return 'blob:fixture';}, revokeObjectURL(){}},
     localStorage:{getItem:() => null, setItem:() => {throw Error('不应写入设置');}},
     document:{querySelector:element, querySelectorAll:selector => selector === 'input[name="additionalOptions"]:checked' ? options : [],
@@ -246,4 +246,29 @@ test('支付待核实行不能单行重试、全量启动或从本行继续，�
   await vm.runInContext('recoverPaidRows()',context);
   assert.equal(vm.runInContext('rowStates[0].status',context),'待核实');assert.equal(vm.runInContext('canRunAdditional(0)',context),false);
   assert.equal(vm.runInContext('canRetryRow(0)',context),false);
+});
+
+test('单项发票下载只传账号及 Profile，按原批次保存 PDF，失败保留旧文件和 Key',async()=>{
+ const {context,elements}=uiFixture();
+ vm.runInContext("rows=[{adsPowerSerialNumber:'paid',email:'fixture@example.invalid',cardNumber:'MUST-NOT-SEND'}];rowStates.push({status:'已完成',paymentConfirmed:true,twoFactorKey:'saved-key'});",context);
+ const reads=[];context.fetch=async(url,init)=>{
+  reads.push({url,init});
+  if(url==='/api/jobs/additional'){assert.equal(JSON.parse(init.body).option,'invoice');assert.ok(!init.body.includes('MUST-NOT-SEND'));return{ok:true,json:async()=>({jobId:'invoice-job',resultToken:'fixture-token'})};}
+  if(url.endsWith('/results'))return{ok:true,json:async()=>[{index:0,invoiceFileName:'invoice-private.pdf'}]};
+  return{ok:true,blob:async()=>new Blob(['%PDF-fixture'])};
+ };
+ await vm.runInContext("startAdditional(0,'invoice')",context);
+ context.payload={type:'additional_finished',jobId:'invoice-job',index:0,option:'invoice',invoiceStatus:'completed',invoiceFileNameAvailable:true};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);
+ await vm.runInContext('refreshPrivateResults()',context);
+ assert.equal(vm.runInContext('rowStates[0].twoFactorKey',context),'saved-key');
+ assert.equal(vm.runInContext('rowStates[0].invoiceFileName',context),'invoice-private.pdf');
+ assert.ok(!elements.get('#task-body').innerHTML.includes('invoice-private.pdf'));
+ assert.ok(elements.get('#task-body').innerHTML.includes('保存发票'));
+ await vm.runInContext('saveInvoice(0)',context);
+ const saved=reads.find(r=>r.url.includes('/invoices/'));assert.equal(saved.url,'/api/jobs/invoice-job/invoices/0');assert.equal(saved.init.headers.Authorization,'Bearer fixture-token');
+ context.payload={type:'additional_finished',jobId:'invoice-job',index:0,option:'invoice',invoiceStatus:'failed',invoiceFileNameAvailable:false,invoiceError:'fixture'};
+ vm.runInContext('events.onmessage({data:JSON.stringify(payload)})',context);
+ assert.equal(vm.runInContext('rowStates[0].invoiceFileName',context),'invoice-private.pdf');
+ const csv=vm.runInContext('buildResultsCsv(rows,rowStates)',context);assert.ok(csv.includes('发票状态'));assert.ok(!csv.includes('invoice-private.pdf'));
 });

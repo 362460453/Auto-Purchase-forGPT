@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { join } from 'node:path';
 import { startAdsPowerProfile, stopAdsPowerProfile } from './adspower.mjs';
 import { startGoogleIncognitoBrowser, stopGoogleIncognitoBrowser } from './google-incognito.mjs';
+import { inspectLatestInvoice, inspectInvoiceDownload, downloadInvoicePdf } from './invoice.mjs';
 import { screenshotDirectory } from '../temp-screenshots.mjs';
 import { resolveProSelection, inspectPricingPage, inspectProPricingCard, inspectProCheckoutOptions, inspectProCheckout, inspectCheckoutSubmitButton } from './pro-plans.mjs';
 import { resolveAdditionalOptions, completePostPurchase, initialPostPurchaseResult, interruptedPostPurchaseResult } from './post-purchase.mjs';
@@ -1622,6 +1623,49 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
   }
 }
 
+async function captureAccountInvoice(page, {debugPort}, onStep = () => {}) {
+  let extra=null, invoicePage=null, browser=null, targetId=null, stage='打开 Billing';
+  try {
+    const attached=await openAccountSettings(page,debugPort,onStep);extra=attached.extra;
+    const billing=attached.page;
+    const read=()=>evaluate(billing,`(${inspectLatestInvoice.toString()})()`);
+    onStep('点击 Billing，等待 Transaction history 最新交易');
+    await clickAndConfirm(billing,'Billing',{alternateTexts:['账单'],region:'left',stabilityMilliseconds:600},async()=>Boolean((await read())?.ready),20000,'Billing 的交易记录尚未加载');
+    let state;
+    while(true){
+      assertTaskActive();state=await read();
+      const inViewport=s=>s?.enabled&&s.point.x>=0&&s.point.x<=s.viewport.width&&s.point.y>=0&&s.point.y<=s.viewport.height;
+      if(inViewport(state)){
+        await sleep(400);const stable=await read();
+        if(inViewport(stable)&&stable.href===state.href&&Math.abs(stable.point.x-state.point.x)<2&&Math.abs(stable.point.y-state.point.y)<2){state=stable;break;}
+      }else if(state){await billing.command('Input.dispatchMouseEvent',{type:'mouseWheel',...state.wheel,deltaX:0,deltaY:state.scrollUp?-300:300});}
+      await sleep(250);
+    }
+    const previous=new Set((await getTargets(debugPort)).map(t=>t.id));
+    const expected=new URL(state.href);
+    stage='打开最新交易发票';onStep('点击 Transaction history 最新交易的发票入口');
+    await mouseClick(billing,state.point);
+    const target=await waitForValue(async()=> (await getTargets(debugPort)).find(t=>{
+      if(t.type!=='page'||previous.has(t.id))return false;
+      try{const u=new URL(t.url);return u.origin===expected.origin&&u.pathname===expected.pathname;}catch{return false;}
+    }),Boolean,45000,'最新交易的 Stripe 发票页面尚未打开');
+    targetId=target.id;invoicePage=await connectCdp(target.webSocketDebuggerUrl);
+    await invoicePage.command('Page.enable');await invoicePage.command('Page.bringToFront');
+    const response=await fetch(`http://127.0.0.1:${debugPort}/json/version`,{signal:taskWaitScope.getStore()?.signal});
+    const endpoint=await response.json();browser=await connectCdp(endpoint.webSocketDebuggerUrl);
+    stage='下载发票 PDF';onStep('点击 Download invoice，等待完整 PDF 下载');
+    const proof=await downloadInvoicePdf(browser,invoicePage,{read:()=>evaluate(invoicePage,`(${inspectInvoiceDownload.toString()})()`),
+      wait:waitForValue,click:mouseClick,pause:sleep,assertActive:assertTaskActive});
+    onStep('最新交易发票 PDF 已下载');
+    return proof;
+  }catch(error){
+    return{invoiceFileName:'',invoiceStatus:'failed',invoiceError:`${stage}失败：${/^发票/.test(error.message)?error.message:'浏览器页面或下载连接未就绪，请单独重试'}`};
+  }finally{
+    if(targetId)await (browser||page).command('Target.closeTarget',{targetId}).catch(()=>{});
+    invoicePage?.close();browser?.close();extra?.close();
+  }
+}
+
 async function configureAccountTwoFactor(page, context, onStep, onProgress) {
   let extra;
   try {
@@ -2007,13 +2051,14 @@ async function runPostPurchaseActions(page, profile, row, proofContext, onStep, 
           manager:page, debugPort:profile.debugPort, isActive:proofContext.isActive, onStep, onVerification:onStatus,
           connectCdp, getTargets, evaluate, mouseClick, clearFocusedField, typeWithKeyboard, dispatchKey, sleep,
         }), row, onProgress),
+        downloadInvoice: () => captureAccountInvoice(page, {debugPort:profile.debugPort}, onStep),
         setupTwoFactor: onProgress => configureAccountTwoFactor(page, { ...proofContext, debugPort: profile.debugPort }, onStep, onProgress),
         onProgress: proofContext.onPostPurchaseProgress,
       });
 }
 
 export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onEvent = () => {}, registerRowControl = () => {}}) {
-  if (!['screenshot', 'cpa', '2fa'].includes(option)) throw new Error('请选择一个附加功能');
+  if (!['screenshot', 'invoice', 'cpa', '2fa'].includes(option)) throw new Error('请选择一个附加功能');
   const serialNumber = String(row?.adsPowerSerialNumber || '').trim();
   if (!serialNumber || (option === 'cpa' && !row.email)) throw new Error('附加任务账号资料不完整');
   const index = row.__uiIndex;
@@ -2027,6 +2072,7 @@ export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onE
   let currentStep = '启动 AdsPower';
   let result = initialPostPurchaseResult([option]);
   const fields = option === 'screenshot' ? ['screenshotUrl', 'screenshotError', 'screenshotStatus']
+    : option === 'invoice' ? ['invoiceFileName','invoiceError','invoiceStatus']
     : option === 'cpa' ? ['cpaJson', 'cpaError', 'cpaStatus'] : ['twoFactorKey', 'twoFactorError', 'twoFactorStatus'];
   // 只发布当前附加项，避免空默认值覆盖另外两项的成功结果。
   const selected = () => Object.fromEntries(fields.map(key => [key, result[key]]));
@@ -2216,7 +2262,7 @@ export async function runUpgradeJob({
         type: 'row_succeeded',
         index: uiIndex,
         ...proof,
-        message: `${prefix}：${product} / ${selection.label} 支付成功；${proof.screenshotError || proof.cpaError || proof.twoFactorError ? '附加任务有未完成项，请查看任务结果' : '已完成所选附加任务'}`,
+        message: `${prefix}：${product} / ${selection.label} 支付成功；${proof.screenshotError || proof.invoiceError || proof.cpaError || proof.twoFactorError ? '附加任务有未完成项，请查看任务结果' : '已完成所选附加任务'}`,
       });
       return { index: uiIndex, serialNumber, status: 'succeeded', ...proof };
     } catch (error) {

@@ -1,4 +1,4 @@
-import { buildResultsCsv, twoFactorStatusText, cpaStatusText } from './task-export.js';
+import { buildResultsCsv, twoFactorStatusText, cpaStatusText, invoiceStatusText } from './task-export.js';
 
 const $ = (selector) => document.querySelector(selector);
 const csvColumns = {
@@ -173,7 +173,7 @@ function startFromRow(index) {
     .filter((row) => canRetryRow(row.__uiIndex));
   return startJob(taskRows);
 }
-const additionalLabels = {screenshot:'截图', cpa:'CPA', '2fa':'2FA'};
+const additionalLabels = {screenshot:'截图', invoice:'下载发票', cpa:'CPA', '2fa':'2FA'};
 function canRunAdditional(index) {
   return rechargeType === 'ads' && !jobRunning && (rowStates[index]?.paymentConfirmed || rowStates[index]?.status === '已完成');
 }
@@ -204,7 +204,7 @@ function renderRows() {
   $('#password-heading').hidden = rechargeType === 'ads';
   $('#task-body').innerHTML = rows.map((row, index) => {
     const state = rowStates[index] || {};
-    const reason = state.reason || [state.screenshotError, state.cpaError, state.twoFactorError].filter(Boolean).join('；');
+    const reason = state.reason || [state.screenshotError, state.invoiceError, state.cpaError, state.twoFactorError].filter(Boolean).join('；');
     const reasonAttr = reason ? ` class="reason-cell" data-reason="${escapeHtml(reason)}" title="单击放大"` : '';
     const retryDisabled = canRetryRow(index) ? '' : ' disabled';
     const continueDisabled = canContinueFromRow(index) ? '' : ' disabled';
@@ -217,10 +217,10 @@ function renderRows() {
     const additionalButtons = rechargeType === 'ads' ? Object.entries(additionalLabels).map(([option, label]) =>
       `<button type="button" class="row-additional" data-additional="${option}" data-row-index="${index}" title="单独执行${label}，保留付款结果"${canRunAdditional(index) ? '' : ' disabled'}>${state.additionalRunning === option ? `${label}中…` : label}</button>`).join('') : '';
     const passwordCell = rechargeType === 'google-incognito' ? `<td>${escapeHtml(row.password)}</td>` : '';
-    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td>${passwordCell}<td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.rowStopRequested ? '终止中…' : state.status || '待执行')}</td><td>${escapeHtml(twoFactorStatusText(state))}</td><td>${escapeHtml(cpaStatusText(state))}</td><td${reasonAttr}>${escapeHtml(reason)}</td><td class="row-actions"><button type="button" class="row-retry" data-retry-index="${index}"${retryDisabled}>重试</button><button type="button" class="row-continue" data-continue-index="${index}" title="从本行往下执行，跳过已完成或已付款行"${continueDisabled}>从本行继续</button>${stopButton}${additionalButtons}</td><td><button type="button" class="row-copy" data-copy-screenshot="${escapeHtml(state.screenshotUrl || '')}"${copyDisabled}>复制</button></td><td>${screenshot}</td></tr>`;
+    return `<tr><td>${escapeHtml(row.adsPowerSerialNumber)}</td><td>${escapeHtml(row.email)}</td>${passwordCell}<td>${escapeHtml(row.cardNumber)}</td><td>${escapeHtml(row.expires_at)}</td><td>${escapeHtml(row.cvv)}</td><td title="${escapeHtml(billingAddressText(row))}">${escapeHtml(billingAddressText(row))}</td><td>${escapeHtml(state.rowStopRequested ? '终止中…' : state.status || '待执行')}</td><td>${escapeHtml(twoFactorStatusText(state))}</td><td>${escapeHtml(cpaStatusText(state))}</td><td>${escapeHtml(invoiceStatusText(state))}${state.invoiceFileName ? `<button type="button" class="secondary" data-save-invoice="${index}">保存发票</button>` : ''}</td><td${reasonAttr}>${escapeHtml(reason)}</td><td class="row-actions"><button type="button" class="row-retry" data-retry-index="${index}"${retryDisabled}>重试</button><button type="button" class="row-continue" data-continue-index="${index}" title="从本行往下执行，跳过已完成或已付款行"${continueDisabled}>从本行继续</button>${stopButton}${additionalButtons}</td><td><button type="button" class="row-copy" data-copy-screenshot="${escapeHtml(state.screenshotUrl || '')}"${copyDisabled}>复制</button></td><td>${screenshot}</td></tr>`;
   }).join('');
   $('#export-results').disabled = rows.length === 0;
-  for (const control of document.querySelectorAll('#csv-file, #recharge-type, #billing-state, #concurrency, input[name=planAmount], input[name=multiplier], input[name=additionalOptions]')) control.disabled = jobRunning || (control.name === 'additionalOptions' && ['cpa', '2fa'].includes(control.value) && rechargeType !== 'ads');
+  for (const control of document.querySelectorAll('#csv-file, #recharge-type, #billing-state, #concurrency, input[name=planAmount], input[name=multiplier], input[name=additionalOptions]')) control.disabled = jobRunning || (control.name === 'additionalOptions' && ['invoice', 'cpa', '2fa'].includes(control.value) && rechargeType !== 'ads');
   $('#task-count').textContent = `${rows.length} 条`;
   $('#task-table-wrap').classList.toggle('scrollable', rows.length > 10);
   $('#task-list').hidden = false; $('#start').disabled = jobRunning || rows.length === 0 || !rows.some((_, index) => canRetryRow(index)); $('#retry-failed').disabled = jobRunning || failedIndexes.length === 0; $('#stop-all').disabled = !jobRunning || stopRequested;
@@ -241,7 +241,7 @@ $('#recharge-type').addEventListener('change', (event) => {
   resultAccesses = [];
   rechargeType = event.target.value;
   for (const option of document.querySelectorAll('input[name=additionalOptions]')) {
-    option.disabled = ['cpa', '2fa'].includes(option.value) && rechargeType !== 'ads';
+    option.disabled = ['invoice', 'cpa', '2fa'].includes(option.value) && rechargeType !== 'ads';
     if (option.disabled) option.checked = false;
   }
   $('#ads-plan-options').hidden = rechargeType !== 'ads';
@@ -287,7 +287,7 @@ async function refreshPrivateResults() {
     // 已缓存在页面的结果服务关闭后仍可导出；只补取通知中存在但尚未收到的秘密。
     const needs = (state, key) => (state?.[`${key}JobId`] || state?.jobId) === access.jobId
       && state?.[`${key}Available`] && state?.[`${key}LoadedJobId`] !== access.jobId;
-    if (!rowStates.some(state => ['twoFactorKey', 'cpaJson'].some(key => needs(state, key)))) continue;
+    if (!rowStates.some(state => ['twoFactorKey', 'cpaJson', 'invoiceFileName'].some(key => needs(state, key)))) continue;
     // 令牌只留在当前页面内存，Key 不经过广播、URL、localStorage 或执行日志。
     const response = await fetch(`/api/jobs/${access.jobId}/results`, {
       headers: {Authorization:`Bearer ${access.resultToken}`}, cache:'no-store',
@@ -298,7 +298,7 @@ async function refreshPrivateResults() {
     for (const result of results) {
       const state = rowStates[result.index];
       if (!state) continue;
-      for (const key of ['twoFactorKey', 'cpaJson']) {
+      for (const key of ['twoFactorKey', 'cpaJson', 'invoiceFileName']) {
         if (!needs(state, key)) continue;
         // 新的独立任务可以替换同项结果；空失败结果不得抹掉上次已拿到的秘密。
         if (typeof result[key] === 'string' && result[key]) state[key] = result[key];
@@ -336,7 +336,7 @@ events.onmessage = (event) => {
     }
     if (['additional_started', 'additional_progress', 'additional_finished'].includes(payload.type)) {
       const prefix = payload.option === '2fa' ? 'twoFactor' : payload.option;
-      const key = payload.option === '2fa' ? 'twoFactorKey' : payload.option === 'cpa' ? 'cpaJson' : 'screenshotUrl';
+      const key = payload.option === '2fa' ? 'twoFactorKey' : payload.option === 'cpa' ? 'cpaJson' : payload.option === 'invoice' ? 'invoiceFileName' : 'screenshotUrl';
       const patch = {jobId:payload.jobId, paymentConfirmed:true, status:'已完成', reason:'',
         additionalRunning:payload.type === 'additional_finished' ? '' : payload.option};
       for (const field of [`${prefix}Status`, `${prefix}Error`]) if (field in payload) patch[field] = payload[field];
@@ -348,7 +348,7 @@ events.onmessage = (event) => {
     }
     // 保留每行本次执行的套餐快照，后续修改全局规格不能改写已完成账号的导出结果。
     if (payload.type === 'row_started' || payload.type === 'browser_started') {
-      rowStates[payload.index] = {...previous, jobId:payload.jobId, status:'执行中', reason:'', screenshotUrl:'', screenshotError:'', completedAt:'',
+      rowStates[payload.index] = {...previous, jobId:payload.jobId, status:'执行中', reason:'', screenshotUrl:'', screenshotError:'', invoiceFileName:'', invoiceError:'', invoiceStatus:'', completedAt:'',
         subscriptionType:payload.subscriptionType || previous.subscriptionType,
         additionalOptions:payload.additionalOptions || previous.additionalOptions};
     }
@@ -359,13 +359,15 @@ events.onmessage = (event) => {
     if (payload.type === 'post_purchase_progress') {
       rowStates[payload.index] = {...previous, screenshotUrl:payload.screenshotUrl || '',
         screenshotError:payload.screenshotError || '', screenshotStatus:payload.screenshotStatus,
+        invoiceStatus:payload.invoiceStatus, invoiceError:payload.invoiceError || '', invoiceFileNameAvailable:payload.invoiceFileNameAvailable,
         twoFactorStatus:payload.twoFactorStatus, twoFactorError:payload.twoFactorError || '',
         cpaStatus:payload.cpaStatus, cpaError:payload.cpaError || '', cpaJsonAvailable:payload.cpaJsonAvailable,
         twoFactorKeyAvailable:payload.twoFactorKeyAvailable};
     }
     if (payload.type === 'row_succeeded') {
       rowStates[payload.index] = {...previous, paymentConfirmed:true, status:'已完成', reason:'', screenshotUrl:payload.screenshotUrl || '',
-        screenshotError:payload.screenshotError || '', screenshotStatus:payload.screenshotStatus, completedAt:payload.timestamp,
+        screenshotError:payload.screenshotError || '', screenshotStatus:payload.screenshotStatus,
+        invoiceStatus:payload.invoiceStatus, invoiceError:payload.invoiceError || '', invoiceFileNameAvailable:payload.invoiceFileNameAvailable, completedAt:payload.timestamp,
         twoFactorStatus:payload.twoFactorStatus, twoFactorError:payload.twoFactorError || '',
         cpaStatus:payload.cpaStatus, cpaError:payload.cpaError || '', cpaJsonAvailable:payload.cpaJsonAvailable,
         twoFactorKeyAvailable:payload.twoFactorKeyAvailable};
@@ -470,6 +472,8 @@ $('#task-body').addEventListener('click', (event) => {
     if (!continueButton.disabled) void startFromRow(Number(continueButton.getAttribute('data-continue-index')));
     return;
   }
+  const invoiceButton=event.target.closest('[data-save-invoice]');
+  if(invoiceButton){void saveInvoice(Number(invoiceButton.getAttribute('data-save-invoice')));return;}
   const copyButton = event.target.closest('[data-copy-screenshot]');
   if (copyButton) {
     event.stopPropagation();
@@ -515,6 +519,21 @@ $('#export-results').addEventListener('click', async () => {
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   $('#activity').textContent = `已导出 ${rows.length} 条任务，CPA / 2FA 列包含已取得的结果，请同时查看各项状态`;
 });
+async function saveInvoice(index) {
+  const state=rowStates[index];
+  const jobId=state?.invoiceFileNameLoadedJobId||state?.invoiceFileNameJobId||state?.jobId;
+  const access=resultAccesses.find(item=>item.jobId===jobId);
+  if(!access||!state?.invoiceFileName)return;
+  try{
+    const response=await fetch(`/api/jobs/${jobId}/invoices/${index}`,{headers:{Authorization:`Bearer ${access.resultToken}`},cache:'no-store'});
+    if(!response.ok)throw new Error('发票读取失败，请单独重新下载');
+    const url=URL.createObjectURL(await response.blob());const link=document.createElement('a');
+    link.href=url;link.download=`invoice-${rows[index].adsPowerSerialNumber}.pdf`;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+    $('#activity').textContent='发票 PDF 已保存';
+  }catch(error){$('#activity').textContent=error.message;}
+}
+
 async function startAdditional(index, option) {
   if (!canRunAdditional(index) || !additionalLabels[option]) return;
   // 先补取旧批次的秘密再开始新任务，跨批次结果按字段分别归属。

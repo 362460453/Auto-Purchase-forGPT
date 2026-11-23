@@ -7,6 +7,7 @@ import {resolveProSelection} from './src/automation/pro-plans.mjs';
 import {resolveAdditionalOptions} from './src/automation/post-purchase.mjs';
 import {createPaidProfiles} from './src/paid-profiles.mjs';
 import {createJobResults} from './src/job-results.mjs';
+import {invoiceDirectory} from './src/automation/invoice.mjs';
 import {screenshotDirectory, clearTemporaryScreenshots} from './src/temp-screenshots.mjs';
 
 const projectDirectory = fileURLToPath(new URL('.', import.meta.url));
@@ -113,6 +114,17 @@ async function handleRequest(request, response) {
     send(response, result ? 200 : 403, result || {error:'无权读取本批任务结果'});
     return;
   }
+  const invoiceMatch=request.url.match(/^\/api\/jobs\/([a-zA-Z0-9-]+)\/invoices\/(\d+)$/);
+  if(request.method==='GET'&&invoiceMatch){
+    const result=privateResults.read(invoiceMatch[1],String(request.headers.authorization||'').replace(/^Bearer /,''));
+    response.setHeader('Cache-Control','no-store');
+    if(!result){send(response,403,{error:'无权读取本批发票'});return;}
+    const file=result.find(row=>row.index===Number(invoiceMatch[2]))?.invoiceFileName;
+    if(!/^invoice-[0-9a-f-]{36}\.pdf$/.test(file||'')){send(response,404,{error:'本行尚无已下载发票'});return;}
+    try{sendText(response,200,await readFile(join(invoiceDirectory,file)),{'Content-Type':'application/pdf','Content-Disposition':'attachment; filename="invoice.pdf"','Cache-Control':'no-store'});}
+    catch{send(response,404,{error:'发票文件不存在，请单独重新下载'});}
+    return;
+  }
   if (request.url === '/api/events') {
     response.writeHead(200, {'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache',Connection:'keep-alive'});
     clients.add(response);
@@ -140,7 +152,7 @@ async function handleRequest(request, response) {
         input.rows = taskRows.map(({password: _ignored, ...row}) => row);
       }
       if (additional) {
-        if (!['screenshot', 'cpa', '2fa'].includes(input.option)) throw new Error('请选择一个附加功能');
+        if (!['screenshot', 'invoice', 'cpa', '2fa'].includes(input.option)) throw new Error('请选择一个附加功能');
         if (!paidProfiles.has(input.row.adsPowerSerialNumber)) throw new Error('没有该 Profile 的付款成功记录，不能补做附加功能');
         if (!Number.isInteger(input.row.__uiIndex) || input.row.__uiIndex < 0 || input.row.__uiIndex >= 100) throw new Error('任务行号无效');
       } else {
