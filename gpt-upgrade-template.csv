@@ -1,2 +1,2 @@
-adsPowerSerialNumber,email,password,cardNumber,expires_at,cvv
-10001,name@example.com,填入邮箱密码,4111111111111111,0931,123
+adsPowerSerialNumber,email,cardNumber,expires_at,cvv
+10001,name@example.com,4111111111111111,0931,123

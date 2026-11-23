@@ -9,38 +9,38 @@
 <body>
   <main class="shell">
     <header>
-      <strong>GPT / UPGRADE</strong>
+      <h1>批量升级 GPT</h1>
       <div class="header-actions"><span>LOCAL ONLY</span><button id="settings-open" class="settings-button" type="button">设置</button></div>
     </header>
-    <section class="hero">
-      <p class="eyebrow">ADSPOWER AUTOMATION · 0.2</p>
-      <h1>批量升级 GPT</h1>
-      <p>导入 AdsPower 账号任务，选择产品和倍率后启动浏览器流程。</p>
-    </section>
     <section class="panel">
-      <div class="toolbar">
-        <div><label class="label">任务文件</label><input id="csv-file" type="file" accept=".csv,text/csv"></div>
-        <a id="download-template" href="#">下载 CSV 模板</a>
-        <div class="concurrency"><label class="label" for="concurrency">并发数</label><input id="concurrency" type="number" min="1" max="10" value="1"></div>
-      </div>
-      <div id="file-name" class="file-name">尚未选择文件</div>
       <div class="choices">
+        <label class="file-control" for="csv-file">任务文件<input id="csv-file" type="file" accept=".csv,text/csv"></label>
+        <a id="download-template" href="#">下载模板</a>
+        <label class="concurrency" for="concurrency">并发数<input id="concurrency" type="number" min="1" max="10" value="1"></label>
         <label>充值类型<select id="recharge-type"><option value="ads" selected>AdsPower</option><option value="google-incognito">谷歌无痕模式</option></select></label>
         <label>个人版套餐<select id="product" disabled><option selected>Pro</option></select></label>
-        <fieldset><legend>倍率</legend><label><input type="radio" name="multiplier" value="20x" checked> 20 倍</label><label><input type="radio" name="multiplier" value="5x"> 5 倍</label></fieldset>
+        <fieldset id="ads-plan-options"><legend>Pro 月费（美元）</legend><label><input type="radio" name="planAmount" value="100"> $100 / 月</label><label><input type="radio" name="planAmount" value="200" checked> $200 / 月</label><label><input type="radio" name="planAmount" value="500"> $500 / 月</label></fieldset>
+        <fieldset id="incognito-plan-options" hidden><legend>倍率</legend><label><input type="radio" name="multiplier" value="20x" checked> 20 倍</label><label><input type="radio" name="multiplier" value="5x"> 5 倍</label></fieldset>
         <label>Billing 地址州<select id="billing-state"><option value="OR" selected>Oregon / 俄勒冈州</option></select></label>
       </div>
+      <div id="file-name" class="file-name" role="status">尚未选择文件</div>
+      <fieldset id="additional-options" class="additional-options"><legend>附加选项（可多选）</legend>
+        <label><input type="checkbox" name="additionalOptions" value="screenshot" checked> 截图</label>
+        <label><input type="checkbox" name="additionalOptions" value="cpa"> 导出 CPA</label>
+        <label><input type="checkbox" name="additionalOptions" value="2fa"> 启用并导出 2FA</label>
+        <p>不勾选则付款成功后直接完成。</p>
+      </fieldset>
       <div id="discovered-plans" class="discovered-plans" hidden></div>
       <div id="validation" class="validation" hidden></div>
-      <div id="task-list" class="task-list" hidden><div class="list-head"><h2>已导入任务</h2><span id="task-count"></span></div><div id="task-table-wrap" class="table-wrap"><table><thead><tr><th>AdsPower 编号</th><th>邮箱</th><th>密码</th><th>银行卡</th><th>有效期</th><th>CVV</th><th>Billing 地址</th><th>状态</th><th>失败原因</th><th>操作</th><th>复制</th><th>截图</th></tr></thead><tbody id="task-body"></tbody></table></div></div>
-      <div class="main-actions"><button id="start" disabled>启动 GPT 升级流程 <span>↗</span></button><button id="retry-failed" class="secondary-action" disabled>重试</button><button id="stop-all" class="secondary-action" type="button" disabled>终止所有任务</button></div>
+      <div id="task-list" class="task-list" hidden><div class="list-head"><h2>已导入任务</h2><div class="export-actions"><span id="task-count"></span><button id="export-results" class="secondary" type="button" disabled>导出 CSV</button></div></div><div id="task-table-wrap" class="table-wrap"><table><thead><tr><th>AdsPower 编号</th><th>邮箱</th><th id="password-heading" hidden>密码</th><th>银行卡</th><th>有效期</th><th>CVV</th><th>Billing 地址</th><th>状态</th><th>2FA 状态</th><th>CPA 状态</th><th>失败原因</th><th>操作</th><th>复制</th><th>截图</th></tr></thead><tbody id="task-body"></tbody></table></div></div>
+      <div class="main-actions"><button id="start" disabled>启动 GPT 升级流程 <span>↗</span></button><button id="retry-failed" class="secondary-action" disabled>重试</button><button id="stop-all" class="secondary-action" type="button" title="只停止未开始的排队任务；正在执行的行可点终止本行" disabled>停止排队</button></div>
       <section class="activity"><h2>执行状态</h2><div id="activity">等待导入文件</div><ul id="events"></ul></section>
     </section>
-    <footer>AdsPower 模式使用六列 CSV；谷歌无痕模式额外读取 mailType 和 mailAccess · Billing 地址按所选州生成 · 拒付只结束当前任务</footer>
+    <footer>AdsPower 模式使用五列 CSV，不读取密码；谷歌无痕模式保留密码及 mailAccess · Billing 地址按所选州生成 · 拒付只结束当前任务</footer>
   </main>
-  <div id="reason-zoom" class="reason-zoom" hidden></div>
+  <div id="reason-zoom" class="reason-zoom" role="dialog" aria-label="失败原因" hidden><div class="reason-actions"><strong>失败原因</strong><button id="copy-reason" type="button" class="secondary">复制全文</button></div><div id="reason-text"></div><div id="reason-copy-status" role="status"></div></div>
   <div id="screenshot-zoom" class="screenshot-zoom" hidden><img alt="Billing 截图"></div>
-  <dialog id="settings-dialog"><form method="dialog" id="settings-form"><div class="dialog-head"><h2>本地设置</h2><button type="submit" class="dialog-close" aria-label="关闭">×</button></div><label>AdsPower 地址<input id="adspower-api-base" type="url" placeholder="http://127.0.0.1:50325" required></label><label>API-Key<input id="adspower-api-key" type="password" autocomplete="off" placeholder="请输入 API-Key" required></label><p class="dialog-note">AdsPower 配置保存在当前浏览器本地。CSV 保持六列；导入时按所选州为每条任务生成 Billing 地址。地址内容不会写入执行日志。</p><div class="dialog-actions"><button id="settings-cancel" type="button" class="secondary">取消</button><button type="submit">保存设置</button></div></form></dialog>
-  <script src="/app.js"></script>
+  <dialog id="settings-dialog"><form method="dialog" id="settings-form"><div class="dialog-head"><h2>本地设置</h2><button type="submit" class="dialog-close" aria-label="关闭">×</button></div><label>AdsPower 地址<input id="adspower-api-base" type="url" placeholder="http://127.0.0.1:50325" required></label><label>API-Key<input id="adspower-api-key" type="password" autocomplete="off" placeholder="请输入 API-Key" required></label><p class="dialog-note">AdsPower 配置保存在当前浏览器本地。AdsPower CSV 保持五列，不需要密码；导入时按所选州为每条任务生成 Billing 地址。地址内容不会写入执行日志。</p><div class="dialog-actions"><button id="settings-cancel" type="button" class="secondary">取消</button><button type="submit">保存设置</button></div></form></dialog>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

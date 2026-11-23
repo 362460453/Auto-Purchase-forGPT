@@ -2,7 +2,11 @@ import http from 'node:http';
 import {appendFile, mkdir, readFile, readdir} from 'node:fs/promises';
 import {extname, isAbsolute, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {runUpgradeJob} from './src/automation/gpt-upgrade.mjs';
+import {runUpgradeJob, runAdditionalJob} from './src/automation/gpt-upgrade.mjs';
+import {resolveProSelection} from './src/automation/pro-plans.mjs';
+import {resolveAdditionalOptions} from './src/automation/post-purchase.mjs';
+import {createPaidProfiles} from './src/paid-profiles.mjs';
+import {createJobResults} from './src/job-results.mjs';
 import {screenshotDirectory, clearTemporaryScreenshots} from './src/temp-screenshots.mjs';
 
 const projectDirectory = fileURLToPath(new URL('.', import.meta.url));
@@ -45,6 +49,10 @@ function persistedEvent(payload) {
     index: Number.isInteger(payload.index) ? payload.index : undefined,
     message: payload.message,
   };
+  if (payload.type === 'row_payment_confirmed' || payload.paymentReviewRequired) {
+    event.serialNumber = payload.serialNumber; event.subscriptionType = payload.subscriptionType;
+    if (payload.paymentReviewRequired) event.paymentReviewRequired = true;
+  }
   if (Array.isArray(payload.plans)) event.plans = payload.plans.map((plan) => ({title: plan.title}));
   return event;
 }
@@ -54,7 +62,7 @@ async function appendEventLog(payload) {
   await appendFile(join(logDirectory, logFileName(payload.timestamp)), `${JSON.stringify(persistedEvent(payload))}\n`, 'utf8');
 }
 
-async function recentEventLogs() {
+async function recentEventLogs(limit = 1000) {
   await mkdir(logDirectory, {recursive:true});
   const events = [];
   for (const name of (await readdir(logDirectory)).filter((item) => item.endsWith('.jsonl')).sort()) {
@@ -68,13 +76,18 @@ async function recentEventLogs() {
       }
     }
   }
-  return events.slice(-1000);
+  return limit ? events.slice(-limit) : events;
 }
 
 const jobs = new Map();
+const privateResults = createJobResults();
+// 从全部本地成功事件恢复付款记录，热更新或重新导入后仍禁止重复充值。
+const paidProfiles = createPaidProfiles(await recentEventLogs(0));
+const busyProfiles = new Set();
 
 const publish = (payload) => {
-  const event = {timestamp:new Date().toISOString(), ...payload};
+  const event = privateResults.capture({timestamp:new Date().toISOString(), ...payload});
+  paidProfiles.capture(event);
   for (const client of [...clients]) {
     try { client.write(`data: ${JSON.stringify(event)}\n\n`); }
     catch { clients.delete(client); }
@@ -93,6 +106,13 @@ http.createServer(async (request, response) => {
 }).listen(port, '127.0.0.1', () => console.log(`GPT upgrade console: http://127.0.0.1:${port}`));
 
 async function handleRequest(request, response) {
+  const resultMatch = request.url.match(/^\/api\/jobs\/([a-zA-Z0-9-]+)\/results$/);
+  if (request.method === 'GET' && resultMatch) {
+    const result = privateResults.read(resultMatch[1], String(request.headers.authorization || '').replace(/^Bearer /, ''));
+    response.setHeader('Cache-Control', 'no-store');
+    send(response, result ? 200 : 403, result || {error:'无权读取本批任务结果'});
+    return;
+  }
   if (request.url === '/api/events') {
     response.writeHead(200, {'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache',Connection:'keep-alive'});
     clients.add(response);
@@ -103,8 +123,78 @@ async function handleRequest(request, response) {
     try { send(response, 200, await recentEventLogs()); } catch (error) { send(response, 500, {error:error.message}); }
     return;
   }
-  if (request.method === 'POST' && request.url === '/api/jobs') {
-    try { const input = await parseBody(request); if (!Array.isArray(input.rows) || !input.rows.length) throw new Error('请先导入 CSV'); if (input.rows.length > 100) throw new Error('单次最多支持 100 条记录'); const jobId = crypto.randomUUID(); const job = {stopped:false}; jobs.set(jobId, job); publish({type:'job_started',jobId,message:`任务已启动：${input.rows.length} 条，并发 ${input.concurrency || 1}`}); runUpgradeJob({...input,jobId,apiBase:input.apiBase || process.env.ADSPOWER_API_BASE,apiKey:input.apiKey || process.env.ADSPOWER_API_KEY,shouldStop:() => job.stopped,onEvent:(payload) => publish({jobId,...payload})}).then((results) => publish({type:'job_finished',jobId,results})).catch((error) => publish({type:'job_failed',jobId,message:error.message})).finally(() => jobs.delete(jobId)); send(response, 202, {jobId}); } catch (error) { send(response, 400, {error:error.message}); }
+  if (request.method === 'GET' && request.url === '/api/paid-profiles') {
+    response.setHeader('Cache-Control', 'no-store');
+    send(response, 200, paidProfiles.list());
+    return;
+  }
+  if (request.method === 'POST' && ['/api/jobs', '/api/jobs/additional'].includes(request.url)) {
+    try {
+      const input = await parseBody(request);
+      const additional = request.url.endsWith('/additional');
+      const taskRows = additional ? [input.row] : input.rows;
+      if (!Array.isArray(taskRows) || !taskRows.length || taskRows.some(row => !row || typeof row !== 'object')) throw new Error('请先导入 CSV');
+      if (taskRows.length > 100) throw new Error('单次最多支持 100 条记录');
+      // 兼容旧控制台：AdsPower 任务不接收密码，登录失效时改为等待人工处理。
+      if (!additional && input.rechargeType !== 'google-incognito') {
+        input.rows = taskRows.map(({password: _ignored, ...row}) => row);
+      }
+      if (additional) {
+        if (!['screenshot', 'cpa', '2fa'].includes(input.option)) throw new Error('请选择一个附加功能');
+        if (!paidProfiles.has(input.row.adsPowerSerialNumber)) throw new Error('没有该 Profile 的付款成功记录，不能补做附加功能');
+        if (!Number.isInteger(input.row.__uiIndex) || input.row.__uiIndex < 0 || input.row.__uiIndex >= 100) throw new Error('任务行号无效');
+      } else {
+        const indexes = taskRows.map((row, index) => row.__uiIndex ?? index);
+        if (indexes.some(index => !Number.isInteger(index) || index < 0 || index >= 100) || new Set(indexes).size !== indexes.length) {
+          throw new Error('任务行号无效或重复');
+        }
+        resolveProSelection(input);
+        input.additionalOptions = resolveAdditionalOptions(input.additionalOptions, input.rechargeType);
+      }
+      const serials = additional || input.rechargeType !== 'google-incognito'
+        ? taskRows.map(row => String(row.adsPowerSerialNumber || '').trim()) : [];
+      if (serials.some(serial => !serial)) throw new Error('AdsPower 编号不能为空');
+      if (new Set(serials).size !== serials.length) throw new Error('同一批次不能重复使用同一个 Profile');
+      if (serials.some(serial => busyProfiles.has(serial))) throw new Error('该 Profile 正在执行任务，请等待结束');
+      if (!additional && serials.some(serial => paidProfiles.has(serial))) throw new Error('存在已付款的 Profile，请只使用该行的附加功能按钮');
+      if (!additional && serials.some(serial => paidProfiles.needsReview(serial))) throw new Error('存在支付结果待核实的 Profile，请先核对账单，不能直接重复充值');
+      const jobId = crypto.randomUUID();
+      const resultToken = privateResults.create(jobId);
+      const job = {stopped:false, rowControls:new Map()};
+      jobs.set(jobId, job);
+      serials.forEach(serial => busyProfiles.add(serial));
+      const common = {jobId, apiBase:input.apiBase || process.env.ADSPOWER_API_BASE,
+        apiKey:input.apiKey || process.env.ADSPOWER_API_KEY, onEvent:payload => publish({jobId, ...payload}),
+        registerRowControl:(index, stop) => {
+          job.rowControls.set(index, stop);
+          return () => { if (job.rowControls.get(index) === stop) job.rowControls.delete(index); };
+        }};
+      publish({type:'job_started',jobId,message:additional ? '独立附加任务已启动' : `任务已启动：${taskRows.length} 条，并发 ${input.concurrency || 1}`});
+      // 独立入口只传账号与 Profile，根本不进入购买服务，也不传银行卡或账单地址。
+      const work = additional
+        ? runAdditionalJob({...common, option:input.option, row:{adsPowerSerialNumber:input.row.adsPowerSerialNumber,
+          email:input.row.email, __uiIndex:input.row.__uiIndex}})
+        : runUpgradeJob({...input, ...common, shouldStop:() => job.stopped});
+      work.then(results => publish({type:'job_finished',jobId,results}))
+        .catch(() => publish({type:'job_failed',jobId,message:'任务执行异常，请检查当前附加结果及浏览器状态'}))
+        .finally(() => { jobs.delete(jobId); serials.forEach(serial => busyProfiles.delete(serial)); });
+      send(response, 202, {jobId, resultToken});
+    } catch (error) { send(response, 400, {error:error.message}); }
+    return;
+  }
+  const stopRowMatch = request.url.match(/^\/api\/jobs\/([a-zA-Z0-9-]+)\/rows\/(\d+)\/stop$/);
+  if (request.method === 'POST' && stopRowMatch) {
+    const [, jobId, rawIndex] = stopRowMatch;
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= 100) { send(response, 400, {error:'任务行号无效'}); return; }
+    const job = jobs.get(jobId);
+    if (!job) { send(response, 404, {error:'该批任务已结束'}); return; }
+    const token = String(request.headers.authorization || '').replace(/^Bearer /, '');
+    if (!privateResults.read(jobId, token)) { send(response, 403, {error:'无权终止本批任务'}); return; }
+    // 只查当前批次的原 UI 行号；取消不会修改停止排队标记，也不会中止其他并发 Profile。
+    const stop = job.rowControls.get(index);
+    if (!stop) { send(response, 409, {error:'该行尚未执行或已经结束'}); return; }
+    send(response, 202, {accepted:stop()});
     return;
   }
   if (request.method === 'POST' && request.url === '/api/jobs/stop') {

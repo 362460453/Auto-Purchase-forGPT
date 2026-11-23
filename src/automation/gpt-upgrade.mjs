@@ -1,18 +1,69 @@
 import { mkdir, writeFile } from 'node:fs/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { join } from 'node:path';
 import { startAdsPowerProfile, stopAdsPowerProfile } from './adspower.mjs';
 import { startGoogleIncognitoBrowser, stopGoogleIncognitoBrowser } from './google-incognito.mjs';
 import { screenshotDirectory } from '../temp-screenshots.mjs';
+import { resolveProSelection, inspectPricingPage, inspectProPricingCard, inspectProCheckoutOptions, inspectProCheckout, inspectCheckoutSubmitButton } from './pro-plans.mjs';
+import { resolveAdditionalOptions, completePostPurchase, initialPostPurchaseResult, interruptedPostPurchaseResult } from './post-purchase.mjs';
+import { inspectAuthenticator, configureAuthenticator } from './two-factor.mjs';
+import { exportCodexCredential } from './codex-oauth.mjs';
+import { createCodexDriver } from './codex-driver.mjs';
+import { waitForSubscriptionPayment } from './payment-wait.mjs';
+import { LOGIN_SELECTORS, inspectLoginPage, loginStateKind, assertLoginState } from './login-state.mjs';
 
 export const PRODUCTS = ['Pro'];
 
-const MULTIPLIERS = ['20x', '5x'];
 const DOM_POLL_MILLISECONDS = 250;
 const CHECKOUT_WAIT_MILLISECONDS = 45000;
+// 以下等待参数只供未进入任务上下文的旧调用兼容；正式任务中的所有等待均使用同一个整行截止时间。
+const PRO_CARD_WAIT_MILLISECONDS = 60000;
+const PROFILE_AVATAR_WAIT_MILLISECONDS = 60000;
 const STRIPE_WAIT_MILLISECONDS = 30000;
+// 旧单函数调用保留默认参数；通过任务入口运行时同样被整行剩余预算覆盖。
+const SUBSCRIBE_BUTTON_WAIT_MILLISECONDS = 60000;
 const SUBSCRIBE_RESULT_WAIT_MILLISECONDS = 90000;
-const ROW_TIMEOUT_MILLISECONDS = 180000;
-const ROW_TIMEOUT_MESSAGE = '超过 3 分钟最大处理时间，已终止当前任务';
+// 单条任务从领取开始最多 10 分钟，包含按钮启用和支付结果等待；到期只结束当前行。
+const ROW_TIMEOUT_MILLISECONDS = 600000;
+const ROW_STOP_MESSAGE = '用户终止本行，已结束等待';
+const ROW_TIMEOUT_MESSAGE = '超过 10 分钟最大处理时间，已终止当前任务';
+// 每行只建立一次截止时间；所有页面等待、CDP 命令和附加动作共享它，进入新阶段不得重新计时。
+const taskWaitScope = new AsyncLocalStorage();
+function runWithTaskBudget(work, isActive, deadline = Date.now() + ROW_TIMEOUT_MILLISECONDS, signal) {
+  return taskWaitScope.run({ deadline, isActive, signal }, work);
+}
+// 手动终止与 10 分钟上限共用同一中断通道；注册表只保存当前行的控制句柄，不保存账号或卡资料。
+function createRowInterruption({index, deadline, controller, registerRowControl, onInterrupt}) {
+  let finished = false;
+  let rejectWait;
+  const wait = new Promise((_, reject) => { rejectWait = reject; });
+  const interrupt = (manual = false) => {
+    if (finished) return false;
+    finished = true;
+    const error = new Error(manual ? ROW_STOP_MESSAGE : ROW_TIMEOUT_MESSAGE);
+    error.code = manual ? 'ROW_STOPPED' : 'ROW_TIMEOUT';
+    onInterrupt(error);
+    // 先确定整行结束原因，再中断未返回的 CDP/启动请求，避免连接错误覆盖用户终止原因。
+    rejectWait(error);
+    controller.abort(error);
+    return true;
+  };
+  const timer = setTimeout(() => interrupt(), Math.max(0, deadline - Date.now()));
+  const unregister = registerRowControl(index, () => interrupt(true));
+  return {wait, finish() { finished = true; clearTimeout(timer); unregister?.(); }};
+}
+function waitDeadline(legacyMilliseconds) {
+  return taskWaitScope.getStore()?.deadline ?? Date.now() + legacyMilliseconds;
+}
+function assertTaskActive(task = taskWaitScope.getStore()) {
+  if (task && (!task.isActive() || task.signal?.aborted || Date.now() >= task.deadline)) {
+    throw task.signal?.reason?.code === 'ROW_STOPPED' ? task.signal.reason : new Error(ROW_TIMEOUT_MESSAGE);
+  }
+}
+function commandTimeout(legacyMilliseconds, task = taskWaitScope.getStore()) {
+  assertTaskActive(task);
+  return task ? Math.max(1, task.deadline - Date.now()) : legacyMilliseconds;
+}
 // Stripe 2026-09 把 Payment/Address iframe 从 elements-inner-payment / elements-inner-address
 // 改成了同一份 elements-inner-accessory-target，只靠 componentName 区分；旧文件名仍要兼容。
 const STRIPE_PAYMENT_TARGET_PATTERN = /elements-inner-[\w.-]*.*componentName=payment(?:&|$)/i;
@@ -22,16 +73,42 @@ const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
 let commandSequence = 0;
 
 function connectCdp(webSocketUrl, timeoutMilliseconds = 30000) {
+  const task = taskWaitScope.getStore();
+  timeoutMilliseconds = commandTimeout(timeoutMilliseconds);
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(webSocketUrl);
     const pending = new Map();
-    const connectTimer = setTimeout(() => reject(new Error(`连接 CDP 超时：${webSocketUrl}`)), timeoutMilliseconds);
+    const listeners = new Map();
+    let connecting = true;
+    const failConnection = message => {
+      if (!connecting) return;
+      connecting = false;
+      clearTimeout(connectTimer);
+      // 握手超时后必须关闭旧连接，避免局部重连遗留迟到的 WebSocket；错误不带调试地址。
+      try { socket.close(); } catch {}
+      reject(new Error(message));
+    };
+    const connectTimer = setTimeout(() => failConnection('连接 CDP 超时'), timeoutMilliseconds);
+    const abortConnection = () => {
+      failConnection(ROW_TIMEOUT_MESSAGE);
+      try { socket.close(); } catch {}
+    };
+    // 整行结束时同时中断握手和未返回的页面命令，防止迟到的 CDP 工作继续输入或点击。
+    task?.signal?.addEventListener('abort', abortConnection, {once:true});
 
     socket.addEventListener('open', () => {
+      if (!connecting) { socket.close(); return; }
+      connecting = false;
       clearTimeout(connectTimer);
       resolve({
         socket,
+        on(method, listener) {
+          if (!listeners.has(method)) listeners.set(method, new Set());
+          listeners.get(method).add(listener);
+          return () => listeners.get(method)?.delete(listener);
+        },
         command(method, params = {}, commandTimeoutMilliseconds = timeoutMilliseconds) {
+          commandTimeoutMilliseconds = commandTimeout(commandTimeoutMilliseconds, task);
           const id = ++commandSequence;
           return new Promise((commandResolve, commandReject) => {
             const timer = setTimeout(() => {
@@ -50,9 +127,20 @@ function connectCdp(webSocketUrl, timeoutMilliseconds = 30000) {
         },
       });
     });
-    socket.addEventListener('error', () => reject(new Error('无法连接 AdsPower 的 CDP 页面')));
+    socket.addEventListener('error', () => failConnection('无法连接 AdsPower 的 CDP 页面'));
+    socket.addEventListener('close', () => {
+      task?.signal?.removeEventListener('abort', abortConnection);
+      failConnection('CDP 连接在握手完成前关闭');
+      for (const callback of pending.values()) callback.reject(new Error('CDP 连接已关闭'));
+      pending.clear();
+      listeners.clear();
+    });
     socket.addEventListener('message', (event) => {
       const message = JSON.parse(event.data);
+      if (message.method) {
+        for (const listener of listeners.get(message.method) || []) listener(message.params);
+        return;
+      }
       const callback = pending.get(message.id);
       if (!callback) return;
       pending.delete(message.id);
@@ -62,7 +150,8 @@ function connectCdp(webSocketUrl, timeoutMilliseconds = 30000) {
 }
 
 async function getTargets(debugPort) {
-  const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
+  assertTaskActive();
+  const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`, {signal:taskWaitScope.getStore()?.signal});
   if (!response.ok) throw new Error(`读取 AdsPower 页面失败：HTTP ${response.status}`);
   return response.json();
 }
@@ -98,13 +187,16 @@ async function evaluate(client, expression, awaitPromise = false, commandTimeout
 }
 
 async function waitForValue(readValue, acceptValue, timeoutMilliseconds, timeoutMessage) {
-  const deadline = Date.now() + timeoutMilliseconds;
+  const deadline = waitDeadline(timeoutMilliseconds);
   let lastValue;
   while (Date.now() <= deadline) {
+    assertTaskActive();
     lastValue = await readValue();
+    assertTaskActive();
     if (acceptValue(lastValue)) return lastValue;
     await sleep(DOM_POLL_MILLISECONDS);
   }
+  if (taskWaitScope.getStore()) throw new Error(ROW_TIMEOUT_MESSAGE);
   throw new Error(`${timeoutMessage}${lastValue ? `；页面状态：${JSON.stringify(lastValue)}` : ''}`);
 }
 
@@ -158,7 +250,7 @@ async function clickExactText(client, text, options = {}) {
       };
     })()`);
   if (options.scrollIntoView) {
-    const deadline = Date.now() + (options.timeoutMilliseconds || 15000);
+    const deadline = waitDeadline(options.timeoutMilliseconds || 15000);
     while (Date.now() <= deadline) {
       const state = await readPoint();
       const point = state?.point;
@@ -206,6 +298,8 @@ async function clickAndConfirm(client, text, options, confirmState, confirmTimeo
   try {
     return await waitForValue(confirmState, Boolean, confirmTimeoutMilliseconds, confirmMessage);
   } catch (firstError) {
+    // 整行预算用尽后不能补点控件；只有未使用任务预算的旧流程保留原局部超时恢复。
+    if (taskWaitScope.getStore()) throw firstError;
     // 只补点当前控件一次：页面完成水合前的鼠标事件可能被吞掉，但不能据此重跑整条任务。
     try {
       await clickExactText(client, text, { ...options, timeoutMilliseconds: Math.min(3000, options.timeoutMilliseconds || 3000) });
@@ -233,16 +327,7 @@ async function waitForPageText(client, text, timeoutMilliseconds, timeoutMessage
 }
 
 async function readPricingModalState(client) {
-  return evaluate(client, `(() => {
-    const href = location.href || '';
-    const bodyText = document.body?.innerText || '';
-    if (!href.includes('#pricing')) return false;
-    // 标准弹窗标题是 Upgrade your plan；右上角 Free offer 会打开 plus-1-month-free 促销价页，没有该标题，但仍必须继续点 See all plans。
-    return bodyText.includes('Upgrade your plan')
-      || bodyText.includes('Claim free offer')
-      || bodyText.includes('See all plans')
-      || /\\bSee all\\b/.test(bodyText);
-  })()`);
+  return evaluate(client, `(${inspectPricingPage.toString()})()`);
 }
 
 async function readHomeUpgradeEntry(client) {
@@ -268,12 +353,13 @@ async function readHomeUpgradeEntry(client) {
   })()`);
 }
 
-async function readAllPlansState(client) {
-  const card = await readProCard(client);
+async function readAllPlansState(client, amount) {
+  const card = await readProCard(client, amount);
   return card || false;
 }
 
-async function readProCard(client) {
+async function readProCard(client, amount) {
+  if (amount) return evaluate(client, `(${inspectProPricingCard.toString()})(${JSON.stringify(amount)})`);
   return evaluate(client, `(() => {
     const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const marker = [...document.querySelectorAll('body *')]
@@ -303,17 +389,20 @@ async function readProCard(client) {
   })()`);
 }
 
-async function clickProCard(client, onPlans) {
-  // See all plans 点击后最多等待 5 秒；在 5 秒内发现 Pro 卡片即立即继续。
+async function clickProCard(client, onPlans, amount) {
+  const expectedAction = amount ? 'Buy now / Upgrade to Pro / Get started / Start now' : 'Upgrade to Pro';
+  const cardWaitMilliseconds = amount ? PRO_CARD_WAIT_MILLISECONDS : 5000;
+  // AdsPower 继续按卡片实际加载状态轮询，出现即继续；暂停开发的无痕模式保留 5 秒等待。
   const card = await waitForValue(
-    () => readProCard(client),
+    () => readProCard(client, amount),
     Boolean,
-    5000,
-    '点击 See all plans 后等待 5 秒，仍未找到 ChatGPT Pro / Upgrade to Pro',
+    cardWaitMilliseconds,
+    `等待 ${cardWaitMilliseconds / 1000} 秒，仍未找到 ChatGPT Pro / ${expectedAction}`,
   );
+  const action = card.button;
   onPlans([{ title: card.title, description: card.description, button: card.button }]);
   let visibleCard = card;
-  const deadline = Date.now() + 10000;
+  const deadline = waitDeadline(10000);
   while (Date.now() <= deadline) {
     const point = visibleCard?.point;
     const viewport = visibleCard?.viewport;
@@ -328,17 +417,19 @@ async function clickProCard(client, onPlans) {
       });
     }
     await sleep(300);
-    visibleCard = await readProCard(client);
+    visibleCard = await readProCard(client, amount);
   }
+  assertTaskActive();
   if (!visibleCard?.point || visibleCard.point.y < 0 || visibleCard.point.y > visibleCard.viewport.height) {
-    throw new Error('已识别 Pro，但 Upgrade to Pro 未滚动到可视区域');
+    throw new Error(`已识别 Pro，但 ${action} 未滚动到可视区域`);
   }
   // 套餐列表展开后仍会继续排版；按钮稳定一秒后重新读取坐标，避免点击落在旧位置。
   await sleep(1000);
-  visibleCard = await readProCard(client);
+  visibleCard = await readProCard(client, amount);
   if (!visibleCard?.point || visibleCard.point.y < 0 || visibleCard.point.y > visibleCard.viewport.height) {
-    throw new Error('Pro 已识别，但 Upgrade to Pro 在点击前离开了可视区域');
+    throw new Error(`Pro 已识别，但 ${action} 在点击前离开了可视区域`);
   }
+  if (amount && visibleCard.selectionStage !== 'checkout' && !visibleCard.selected) throw new Error(`Pro 月费未保持在 $${amount}，停止进入结账`);
   await mouseClick(client, visibleCard.point);
 
   const readTransition = () => evaluate(client, `(() => {
@@ -346,18 +437,88 @@ async function clickProCard(client, onPlans) {
     return /\\/checkout\\//.test(location.href) || text.includes('Getting your plan ready');
   })()`);
   try {
-    await waitForValue(readTransition, Boolean, 12000, 'Upgrade to Pro 已点击，但页面没有进入购买流程');
+    await waitForValue(readTransition, Boolean, 12000, `${action} 已点击，但页面没有进入购买流程`);
   } catch (firstError) {
-    // React 水合阶段可能吞掉第一次鼠标事件；只重新定位并补点当前 Upgrade to Pro 一次。
-    const retryCard = await readProCard(client);
+    if (taskWaitScope.getStore()) throw firstError;
+    // React 水合阶段可能吞掉第一次鼠标事件；只重新定位并补点当前 Pro 卡片的购买按钮一次。
+    const retryCard = await readProCard(client, amount);
     if (!retryCard?.point || retryCard.point.y < 0 || retryCard.point.y > retryCard.viewport.height) throw firstError;
+    if (amount && retryCard.selectionStage !== 'checkout' && !retryCard.selected) throw firstError;
     await mouseClick(client, retryCard.point);
     try {
-      await waitForValue(readTransition, Boolean, 12000, '补点 Upgrade to Pro 后仍未进入购买流程');
+      await waitForValue(readTransition, Boolean, 12000, `补点 ${action} 后仍未进入购买流程`);
     } catch {
       throw firstError;
     }
   }
+  return action;
+}
+
+async function selectProAmount(client, amount) {
+  const readCard = () => readProCard(client, amount);
+  // 等待 Pro 卡片和价格按钮进入视口，共用整行剩余时间；坐标不稳定时不点击，避免选到邻近套餐。
+  const deadline = waitDeadline(15000);
+  while (Date.now() < deadline) {
+    const card = await readCard();
+    if (card?.selectionStage === 'checkout') return 'checkout';
+    const p = card?.optionPoint;
+    if (p && p.x >= 0 && p.x <= card.viewport.width && p.y >= 0 && p.y <= card.viewport.height) {
+      await sleep(400);
+      const stable = await readCard();
+      const next = stable?.optionPoint;
+      if (next && Math.abs(next.x - p.x) < 2 && Math.abs(next.y - p.y) < 2
+        && next.x >= 0 && next.x <= stable.viewport.width && next.y >= 0 && next.y <= stable.viewport.height) {
+        if (!stable.selected) await mouseClick(client, next);
+        // 卡片月费及选中态都更新才点购买；正式任务继续等整行剩余时间，不能默认选 $100。
+        await waitForValue(readCard, (value) => value?.selected, 5000, `Pro $${amount} 已点击，但卡片月费或选中状态没有更新`);
+        return 'pricing';
+      }
+    } else if (card) {
+      await client.command('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: card.viewport.width / 2, y: card.viewport.height / 2,
+        deltaX: 0, deltaY: p && p.y < 0 ? -400 : 400,
+      });
+    }
+    await sleep(DOM_POLL_MILLISECONDS);
+  }
+  assertTaskActive();
+  throw new Error(`没有找到稳定可点击的 Pro $${amount} 规格按钮`);
+}
+
+async function readProCheckoutOptions(client, amount) {
+  return evaluate(client, `(${inspectProCheckoutOptions.toString()})(${JSON.stringify(amount)})`);
+}
+
+async function selectProCheckoutAmount(client, amount) {
+  const readOptions = () => readProCheckoutOptions(client, amount);
+  // 配置页加载、选中属性和布局均等待整行剩余时间；未找到对应金额时绝不沿用默认 $100 填卡。
+  const deadline = waitDeadline(CHECKOUT_WAIT_MILLISECONDS);
+  const inViewport = state => state?.optionPoint && state.optionPoint.x >= 0 && state.optionPoint.x <= state.viewport.width
+    && state.optionPoint.y >= 0 && state.optionPoint.y <= state.viewport.height;
+  while (Date.now() < deadline) {
+    assertTaskActive();
+    const state = await readOptions();
+    if (state?.selected) return;
+    if (state?.enabled && inViewport(state)) {
+      await sleep(400);
+      const stable = await readOptions();
+      if (stable?.selected) return;
+      if (stable?.enabled && inViewport(stable)
+        && Math.abs(state.optionPoint.x - stable.optionPoint.x) < 2
+        && Math.abs(state.optionPoint.y - stable.optionPoint.y) < 2) {
+        await mouseClick(client, stable.optionPoint);
+        await waitForValue(readOptions, next => next?.selected, CHECKOUT_WAIT_MILLISECONDS,
+          `Pro 配置页 $${amount} 已点击，但单选状态尚未更新`);
+        return;
+      }
+    } else if (state && !inViewport(state)) {
+      await client.command('Input.dispatchMouseEvent', {type:'mouseWheel', x:state.viewport.width / 2,
+        y:state.viewport.height / 2, deltaX:0, deltaY:state.optionPoint.y < 0 ? -400 : 400});
+    }
+    await sleep(DOM_POLL_MILLISECONDS);
+  }
+  assertTaskActive();
+  throw new Error(`Pro 配置页尚未出现稳定可点击的 $${amount} 规格`);
 }
 
 async function waitForCheckout(client) {
@@ -695,7 +856,7 @@ async function waitForCompletedStripeCard(payment, row) {
       && !state.cvvInvalid
       && state.errors.length === 0;
   const waitForFinalState = async (timeoutMilliseconds) => {
-    const deadline = Date.now() + timeoutMilliseconds;
+    const deadline = waitDeadline(timeoutMilliseconds);
     let state;
     while (Date.now() <= deadline) {
       state = await readState();
@@ -705,7 +866,7 @@ async function waitForCompletedStripeCard(payment, row) {
     return state;
   };
 
-  // 三项全部输入并失焦后，再给 Stripe 最多 3 秒完成格式化与最终校验。
+  // 三项全部输入并失焦后按最终状态等待 Stripe 校验，正式任务共用整行剩余时间。
   const state = await waitForFinalState(3000);
   if (!isComplete(state)) {
     // 状态只保留位数和 Stripe 错误文本，禁止把完整卡资料写入任务日志。
@@ -753,7 +914,7 @@ async function fillStripeCardNumberStep(payment, cardNumber, onStep = () => {}) 
   const expectedDigits = normalizeDigits(cardNumber);
   const expectedDigitsLength = expectedDigits.length;
   // 卡号输入可能被 Stripe 刷新打断；在当前字段内继续补齐剩余位数，超时后才失败并关闭当前 Profile。
-  const deadline = Date.now() + STRIPE_WAIT_MILLISECONDS;
+  const deadline = waitDeadline(STRIPE_WAIT_MILLISECONDS);
   let intervalMilliseconds = 140;
   let waitForRefresh = false;
 
@@ -1019,25 +1180,7 @@ async function fillStripeBillingAddress(debugPort, row, onStep = () => {}) {
 }
 
 async function readSubscribeButtonState(page) {
-  return evaluate(page, `(() => {
-    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-    const visible = (node) => {
-      const rect = node.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== 'hidden';
-    };
-    // 结账主 CTA 文案会随产品变化，只认含 Subscribe 的按钮，不按产品名精确匹配。
-    const isSubscribeCta = (label) => /\\bSubscribe\\b/i.test(label)
-      && !/\\bUnsubscribe\\b/i.test(label)
-      && label.length <= 48;
-    const button = [...document.querySelectorAll('button,[role="button"]')]
-      .find((node) => visible(node) && isSubscribeCta(normalize(node.innerText || node.textContent || node.getAttribute('aria-label'))));
-    if (!button) return {found:false, enabled:false, label:''};
-    return {
-      found: true,
-      enabled: !button.disabled && button.getAttribute('aria-disabled') !== 'true',
-      label: normalize(button.innerText || button.textContent || button.getAttribute('aria-label')),
-    };
-  })()`);
+  return evaluate(page, `(${inspectCheckoutSubmitButton.toString()})()`);
 }
 
 async function readSubscribeOutcome(page) {
@@ -1055,28 +1198,16 @@ async function readSubscribeOutcome(page) {
     const alertTexts = alertNodes
       .map((node) => normalize(node.innerText || node.textContent))
       .filter(Boolean);
-    // 结账页左上角的任何可见提示都视为本次支付失败，不能只依赖固定英文文案。
-    const topLeftPrompt = alertNodes
-      .map((node) => ({ node, text: normalize(node.innerText || node.textContent) }))
-      .filter(({ node, text }) => {
-        const rect = node.getBoundingClientRect();
-        return Boolean(text)
-          && rect.top >= 0
-          && rect.top <= innerHeight * 0.4
-          && rect.left >= 0
-          && rect.left <= innerWidth * 0.6;
-      })
-      .sort((left, right) => left.node.getBoundingClientRect().top - right.node.getBoundingClientRect().top)[0]?.text || '';
-    const declinedFromBody = (body.match(/Your payment was declined\\.[^.]{0,80}\\./i) || body.match(/Your payment was declined\\. Try a different card\\./i) || [])[0] || '';
-    const error = topLeftPrompt
-      || alertTexts.find((text) => /declined|try a different card|payment failed|couldn['’]t (be )?process|card was declined/i.test(text))
-      || (body.includes('Your payment was declined') ? (declinedFromBody || 'Your payment was declined. Try a different card.') : '');
+    // 仅明确的支付错误结束等待；普通状态通知、转圈、按钮禁用都不是失败证据。
+    const declinedFromBody = (body.match(/Your (?:payment|card) (?:was|has been) declined\\./i) || [])[0] || '';
+    const error = alertTexts.find((text) => /declined|try a different card|payment failed|couldn['’]t (be )?process/i.test(text))
+      || declinedFromBody;
     const leftCheckout = !/\\/checkout\\//i.test(location.href);
     const successText = /you('re| are) all set|welcome to chatgpt pro|subscription (is )?now active|thanks for subscribing/i.test(body);
     const processing = [...document.querySelectorAll('button,[role="button"]')].some((node) => {
       if (!visible(node)) return false;
       const label = normalize(node.innerText || node.textContent || node.getAttribute('aria-label'));
-      const subscribeLike = /\\bSubscribe\\b/i.test(label) || node.getAttribute('aria-busy') === 'true';
+      const subscribeLike = /\\bSubscribe\\b/i.test(label) || label === 'Upgrade to Pro' || node.getAttribute('aria-busy') === 'true';
       if (!subscribeLike) return false;
       return node.disabled
         || node.getAttribute('aria-disabled') === 'true'
@@ -1115,19 +1246,45 @@ function describeSubscribeProgress(state, prefix) {
   return `${prefix}页面已开始处理支付`;
 }
 
-async function clickSubscribeAndAwaitResult(page, debugPort, onStep = () => {}) {
-  onStep('账单地址已填写，等待 Subscribe 订阅按钮可点击');
+async function clickSubscribeAndAwaitResult(page, debugPort, onStep = () => {}, proofContext = {}) {
+  if (proofContext.rechargeType === 'ads') {
+    return waitForSubscriptionPayment({
+      readButton: () => readSubscribeButtonState(page),
+      readOutcome: submitted => submitted ? readSubscribeProgress(page, debugPort) : readSubscribeOutcome(page),
+      submit: async button => {
+        // 稳定后重新读取唯一按钮及坐标；按钮重新禁用或离开视口时继续等，绝不强点。
+        await sleep(600);
+        const current = await readSubscribeButtonState(page);
+        const point = current?.point;
+        if (!current?.enabled || current.label !== button.label || !point) return false;
+        if (point.y < 0 || point.y > current.viewport.height) {
+          await page.command('Input.dispatchMouseEvent', { type: 'mouseWheel', x: current.viewport.width / 2,
+            y: current.viewport.height / 2, deltaX: 0, deltaY: point.y < 0 ? -400 : 400 });
+          return false;
+        }
+        if (point.x < 0 || point.x > current.viewport.width) return false;
+        if (!button.point || Math.abs(point.x - button.point.x) > 4 || Math.abs(point.y - button.point.y) > 4) return false;
+        assertTaskActive();
+        // 鼠标提交开始后就可能扣款，中途终止不能当作未支付；结果未确认时禁止直接重跑充值。
+        proofContext.onPaymentSubmitted?.();
+        await mouseClick(page, point);
+        return true;
+      },
+      wait: () => sleep(DOM_POLL_MILLISECONDS),
+      isActive: proofContext.isActive,
+      onStep,
+    });
+  }
+  onStep('账单地址已填写，等待结账订阅按钮可点击（最多 60 秒）');
   const button = await waitForValue(
     () => readSubscribeButtonState(page),
     (state) => state?.found && state?.enabled,
-    15000,
-    // 只认含 Subscribe 的结账主按钮，不要求产品名一字不差。超时后点击会无效，当前任务失败，其他并发任务继续。
-    '资料已填完，但含 Subscribe 的订阅按钮仍不可点击',
+    SUBSCRIBE_BUTTON_WAIT_MILLISECONDS,
+    '资料填写后已等待 60 秒，但结账订阅按钮（Upgrade to Pro / Subscribe）仍不可点击',
   );
   const clickOptions = {
-    alternateTexts: ['Subscribe'],
     timeoutMilliseconds: 10000,
-    timeoutMessage: '没有找到可点击的 Subscribe',
+    timeoutMessage: `没有找到可点击的 ${button.label}`,
     stabilityMilliseconds: 600,
   };
   const progressed = async () => {
@@ -1136,6 +1293,7 @@ async function clickSubscribeAndAwaitResult(page, debugPort, onStep = () => {}) 
   };
 
   onStep(`第一次点击 ${button.label || 'Subscribe'}`);
+  proofContext.onPaymentSubmitted?.();
   await clickExactText(page, button.label || 'Subscribe', clickOptions);
   let state;
   let usedRetry = false;
@@ -1162,7 +1320,7 @@ async function clickSubscribeAndAwaitResult(page, debugPort, onStep = () => {}) 
     () => readSubscribeProgress(page, debugPort),
     (item) => Boolean(item?.error || item?.success),
     SUBSCRIBE_RESULT_WAIT_MILLISECONDS,
-    // 支付网关确认可能超过 45 秒；90 秒内既不跳转也不拒付则当前任务失败，整条任务仍受 3 分钟上限约束。
+    // 支付网关确认可能超过 45 秒；90 秒内既不跳转也不拒付则当前任务失败，整条任务仍受 10 分钟上限约束。
     '已点击 Subscribe，但 90 秒内没有出现支付成功或拒付提示',
   );
   const waitedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
@@ -1248,7 +1406,7 @@ function readBottomLeftProfilePointExpression() {
       const rect = node.getBoundingClientRect();
       return rect.width > 8 && rect.height > 8 && getComputedStyle(node).visibility !== 'hidden';
     };
-    // 只查左下角可点击节点，不要扫整页 DOM。首页已经出来就应该立刻能点到头像。
+    // 只查左下角可点击节点，不要扫整页 DOM；首页侧栏可能晚于页面主体出现，由调用方持续轮询。
     const inBottomLeft = (rect) => rect.left < Math.min(420, innerWidth * 0.45) && rect.bottom > innerHeight * 0.55;
     const blocked = /^(Upgrade|New chat|Search chats|Log out|Settings|Help|Library|Projects|Scheduled|Plugins|More)$/i;
     const storeLike = /GPT Store|Explore GPTs|\\bSora\\b/i;
@@ -1259,12 +1417,13 @@ function readBottomLeftProfilePointExpression() {
         if (!inBottomLeft(rect)) return false;
         const label = normalize(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
         if (blocked.test(label) || /\\bupgrade\\b/i.test(label) || storeLike.test(label)) return false;
-        return Boolean(label) || node.getAttribute('aria-haspopup');
+        return /^Open profile menu$/i.test(label) || /\\b(Pro|Plus|Free|Business|Team|Go|Enterprise)\\b/i.test(label);
       })
       .map((node) => {
         const rect = node.getBoundingClientRect();
         const label = normalize(node.getAttribute('aria-label') || node.innerText || node.textContent || '');
         return {
+          profileMenu: /^Open profile menu$/i.test(label),
           hasPlan: /\\b(Pro|Plus|Free|Business|Team|Go|Enterprise)\\b/i.test(label),
           x: rect.left + Math.min(28, Math.max(14, rect.width * 0.12)),
           y: rect.top + Math.min(rect.height / 2, 28),
@@ -1272,7 +1431,7 @@ function readBottomLeftProfilePointExpression() {
           width: rect.width,
         };
       });
-    candidates.sort((left, right) => Number(right.hasPlan) - Number(left.hasPlan) || right.width - left.width || right.top - left.top);
+    candidates.sort((left, right) => Number(right.profileMenu) - Number(left.profileMenu) || Number(right.hasPlan) - Number(left.hasPlan) || right.width - left.width || right.top - left.top);
     return {
       point: candidates[0] || null,
       viewport: {width: innerWidth, height: innerHeight},
@@ -1296,18 +1455,37 @@ async function readSettingsPageState(page) {
   return evaluate(page, `(() => {
     const path = location.pathname || '';
     const bodyText = document.body?.innerText || '';
-    // 当前 Settings 会跳转到独立页面，不再等待旧版弹窗结构。
-    return /^\/settings(?:\/|$)/i.test(path)
-      && (/Settings|General|Billing|账单|设置/i.test(bodyText));
+    // Settings 兼容独立页面及弹窗，两种布局均须有设置内容才能继续。
+    const settingsVisible = [...document.querySelectorAll('[role="dialog"],dialog')].some(node => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && /Settings|设置/i.test(node.innerText || '')
+        && /Security and login|Billing|账单/i.test(node.innerText || '');
+    });
+    return settingsVisible || ((path === '/settings' || path.startsWith('/settings/'))
+      && (/Settings|General|Billing|账单|设置/i.test(bodyText)));
   })()`);
 }
 
+function inspectBillingProof() {
+  const text = document.body?.innerText || '';
+  const labels = [...document.querySelectorAll('h1,h2,h3,p,span,div')];
+  const email = labels.find(node => node.textContent?.trim() === 'Billing email');
+  const plan = labels.find(node => /^ChatGPT (Pro|Plus|Team|Business|Go)(?: \d+)?$/.test(node.textContent?.trim() || ''));
+  let panel = email?.parentElement;
+  while (panel && !(panel.scrollHeight > panel.clientHeight && /auto|scroll/.test(getComputedStyle(panel).overflowY))) panel = panel.parentElement;
+  const rect = panel?.getBoundingClientRect() || {left:0,top:0,right:innerWidth,bottom:innerHeight};
+  const visible = node => {
+    if (!node) return false;
+    const r = node.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.top >= Math.max(0,rect.top) && r.bottom <= Math.min(innerHeight,rect.bottom);
+  };
+  return {ready:Boolean(email && plan) && !/Loading (settings|transactions)/i.test(text),
+    emailVisible:visible(email) && email.getBoundingClientRect().bottom + 28 < Math.min(innerHeight,rect.bottom),
+    planVisible:visible(plan), wheel:{x:Math.min(innerWidth - 20,(rect.left+rect.right)/2),y:Math.min(innerHeight-20,(rect.top+rect.bottom)/2)}};
+}
+
 async function readBillingPanelState(page) {
-  return evaluate(page, `(() => {
-    const bodyText = document.body?.innerText || '';
-    return bodyText.includes('Billing email')
-      || /ChatGPT (Pro|Plus|Team|Business|Go)|Your plan auto-renews|Change plan/i.test(bodyText);
-  })()`);
+  return evaluate(page, `(${inspectBillingProof.toString()})()`);
 }
 
 async function saveViewportScreenshot(page, fileName) {
@@ -1349,23 +1527,26 @@ async function ensureHomePageForBillingProof(page, debugPort, onStep = () => {})
   return { page, extra: null };
 }
 
-async function captureAccountBillingProof(page, { jobId, index, debugPort }, onStep = () => {}) {
-  let extra = null;
+async function openAccountSettings(page, debugPort, onStep = () => {}) {
+  const attached = await ensureHomePageForBillingProof(page, debugPort, onStep);
+  const homePage = attached.page;
   try {
-    const attached = await ensureHomePageForBillingProof(page, debugPort, onStep);
-    const homePage = attached.page;
-    extra = attached.extra;
-    onStep('首页已打开，立即查找并点击左下角头像');
+    // Billing 与 2FA 共用 Settings；支持独立设置页及用户截图中的弹窗，已打开时直接复用。
+    await homePage.command('Page.bringToFront');
+    if (await readSettingsPageState(homePage).catch(() => false)) return attached;
+    onStep('等待首页左下角头像加载，与整行任务共享剩余时间，出现后立即继续');
     const profilePoint = await waitForValue(
       () => evaluate(homePage, readBottomLeftProfilePointExpression()),
       (state) => Boolean(state?.point)
         && state.point.x >= 0 && state.point.x <= state.viewport.width
         && state.point.y >= 0 && state.point.y <= state.viewport.height,
-      8000,
-      // 头像在首页侧栏底部，页面已经刷出来就该立刻能点；超时只影响截图，不能把已扣款任务改成失败重试。
-      '充值完成后已返回 chatgpt.com，但没有出现左下角头像',
+      PROFILE_AVATAR_WAIT_MILLISECONDS,
+      '已返回 chatgpt.com，但等待 60 秒仍未出现可点击的左下角头像',
     );
-    await mouseClick(homePage, profilePoint.point);
+    await sleep(250);
+    const stableProfile = await evaluate(homePage, readBottomLeftProfilePointExpression());
+    if (!stableProfile?.point) throw new Error('账号菜单布局尚未稳定');
+    await mouseClick(homePage, stableProfile.point);
     try {
       await waitForValue(() => readSettingsMenuState(homePage), Boolean, 8000, '左下角头像已点击，但没有出现 Settings');
     } catch (firstError) {
@@ -1391,6 +1572,19 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
       'Settings 已点击，但设置页面没有打开',
     );
 
+    return attached;
+  } catch (error) {
+    attached.extra?.close();
+    throw error;
+  }
+}
+
+async function captureAccountBillingProof(page, { jobId, index, debugPort }, onStep = () => {}) {
+  let extra = null;
+  try {
+    const attached = await openAccountSettings(page, debugPort, onStep);
+    const homePage = attached.page;
+    extra = attached.extra;
     onStep('点击 Billing');
     await clickAndConfirm(
       homePage,
@@ -1402,13 +1596,20 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
         timeoutMessage: '设置弹窗里没有找到可点击的 Billing',
         stabilityMilliseconds: 600,
       },
-      () => readBillingPanelState(homePage),
-      10000,
+      async () => (await readBillingPanelState(homePage)).ready,
+      20000,
       'Billing 已点击，但账单内容没有出现',
     );
 
-    onStep('Billing 已打开，截取当前完整页面');
-    await sleep(600);
+    onStep('Billing 已加载，微调滚动后截图');
+    // 等待完整账单而非仅出现套餐标题；小幅滚动让邮箱入镜，无法同时容纳时仍保存截图，不重跑付款。
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const state = await readBillingPanelState(homePage);
+      if (state.emailVisible) break;
+      await homePage.command('Input.dispatchMouseEvent', {type:'mouseWheel', ...state.wheel, deltaX:0, deltaY:100});
+      await sleep(250);
+    }
+    await sleep(300);
     const fileName = `${jobId || 'job'}-${Number(index) || 0}.png`;
     const screenshotUrl = await saveViewportScreenshot(homePage, fileName);
     return { screenshotUrl };
@@ -1418,6 +1619,41 @@ async function captureAccountBillingProof(page, { jobId, index, debugPort }, onS
     return { screenshotUrl: '', screenshotError: error.message };
   } finally {
     if (extra) extra.close();
+  }
+}
+
+async function configureAccountTwoFactor(page, context, onStep, onProgress) {
+  let extra;
+  try {
+    if (!context.isActive()) throw new Error('任务已结束');
+    const attached = await openAccountSettings(page, context.debugPort, onStep);
+    const securityPage = attached.page;
+    extra = attached.extra;
+    const read = (action = 'state') => evaluate(securityPage,
+      `(${inspectAuthenticator.toString()})(${JSON.stringify(action)})`, false, 3000);
+    onStep('打开 Security and login');
+    // 安全页等待验证器开关，与整行任务共享剩余时间；未确认开关时不能修改其他安全设置。
+    await clickAndConfirm(securityPage, 'Security and login', {
+      region: 'left', timeoutMilliseconds: 10000, stabilityMilliseconds: 600,
+    }, async () => ['enabled', 'disabled'].includes((await read()).stage), 10000,
+    'Security and login 未显示 Authenticator app');
+    return await configureAuthenticator({
+      read, now: Date.now, sleep, onStep, isActive: context.isActive,
+      click: point => mouseClick(securityPage, point),
+      scroll: state => securityPage.command('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: Math.min(state.viewport.width - 20, Math.max(1, state.point.x)),
+        y: state.viewport.height / 2, deltaX: 0, deltaY: state.point.y < 0 ? -300 : 300,
+      }),
+      type: async code => {
+        await typeWithKeyboard(securityPage, code, { intervalMilliseconds: 100 });
+        await dispatchKey(securityPage, 'Tab', 'Tab', 9);
+      },
+    }, onProgress);
+  } catch {
+    // 安全页可能包含 Key 或验证码，禁止传播原始页面异常到日志。
+    return { twoFactorStatus: 'failed', twoFactorError: '无法完成 2FA 安全设置，请检查当前账号页面' };
+  } finally {
+    extra?.close();
   }
 }
 
@@ -1481,7 +1717,7 @@ async function readMailCode(row, debugPort) {
   let mailPage;
   try {
     const created = await targetResult.command('Target.createTarget', {url: 'https://mail2.ap1x.xyz/'});
-    const deadline = Date.now() + 30000;
+    const deadline = waitDeadline(30000);
     while (Date.now() <= deadline) {
       const targets = await getTargets(debugPort).catch(() => []);
       const target = targets.find((item) => item.id === created.targetId && item.webSocketDebuggerUrl);
@@ -1543,7 +1779,32 @@ async function completeEmailVerification(page, row, debugPort, onStatus) {
   onStatus('邮箱验证码已输入，已继续 ChatGPT 登录');
 }
 
-async function fillLoginIfNeeded(page, row, onStatus, rechargeType, debugPort) {
+async function fillLoginIfNeeded(page, row, onStatus, rechargeType, debugPort, isActive = () => true) {
+  if (rechargeType !== 'google-incognito') {
+    // AdsPower 优先复用登录状态，不读取密码；人工登录等待计入整行 10 分钟，未回到首页绝不进入充值。
+    const deadline = waitDeadline(ROW_TIMEOUT_MILLISECONDS);
+    const submitted = new Set();
+    const notified = new Set();
+    while (isActive() && Date.now() < deadline) {
+      const state = assertLoginState(await evaluate(page, `(${inspectLoginPage.toString()})(${JSON.stringify(LOGIN_SELECTORS)})`));
+      const kind = loginStateKind(state);
+      if (kind === 'home') return;
+      if (['password', 'manual', 'code'].includes(kind) && !notified.has(kind)) {
+        onStatus('ChatGPT 需要登录验证，请在 AdsPower 窗口手动完成密码/验证码或安全验证；本程序不读取密码');
+        notified.add(kind);
+      }
+      if (kind === 'email' && !submitted.has(kind)) {
+        await focusAndType(page, LOGIN_SELECTORS.email, row.email, {label:'ChatGPT 登录邮箱'});
+        await clickExactText(page, 'Continue', {timeoutMilliseconds:20000, timeoutMessage:'没有找到登录邮箱后的 Continue'});
+        submitted.add(kind);
+      } else if (kind === 'entry' && !submitted.has(kind)) {
+        await clickExactText(page, state.loginLabel, {timeoutMilliseconds:20000, timeoutMessage:'没有找到 ChatGPT 登录入口'});
+        submitted.add(kind);
+      }
+      await sleep(DOM_POLL_MILLISECONDS);
+    }
+    throw new Error('等待 ChatGPT 人工登录超时，尚未确认登录成功');
+  }
   const entryState = await waitForValue(
     () => evaluate(page, `(() => {
       const visible = (node) => { if (!node) return false; const rect = node.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; };
@@ -1585,7 +1846,7 @@ async function fillLoginIfNeeded(page, row, onStatus, rechargeType, debugPort) {
   if (rechargeType === 'google-incognito') await completeEmailVerification(page, row, debugPort, onStatus);
 }
 
-async function openChatGptAndPreparePayment(profile, row, product, multiplier, onStatus, onPlans, onStep, proofContext = {}) {
+async function openChatGptAndPreparePayment(profile, row, product, selection, onStatus, onPlans, onStep, proofContext = {}) {
   const page = await connectChatGptPage(profile.debugPort);
   try {
     await page.command('Page.enable');
@@ -1629,7 +1890,7 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
     );
 
     onStep('处理 ChatGPT 登录');
-    await fillLoginIfNeeded(page, row, onStatus, proofContext.rechargeType || 'ads', profile.debugPort);
+    await fillLoginIfNeeded(page, row, onStatus, proofContext.rechargeType || 'ads', profile.debugPort, proofContext.isActive);
 
     onStep('等待 ChatGPT 首页完全加载并稳定');
     await sleep(1200);
@@ -1655,39 +1916,65 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
       },
       () => readPricingModalState(page),
       10000,
-      `${entry.text} 已点击，但 URL 和套餐弹窗都没有变化`,
+      `${entry.text} 已点击，但未确认套餐页（/plans 或 #pricing）及套餐内容加载完成`,
     );
     onStep(`${entry.text} 已点击，套餐弹窗已加载`);
 
-    onStep('向下滚动到套餐页面底部，寻找 See all plans');
-    onStep('点击 See all plans');
-    await clickAndConfirm(
-      page,
-      'See all plans',
-      {
-        alternateTexts: ['See all'],
-        timeoutMilliseconds: 20000,
-        timeoutMessage: '滚动套餐页面后仍没有找到可见的 See all plans',
-        stabilityMilliseconds: 800,
-        scrollIntoView: true,
-      },
-      () => readAllPlansState(page),
-      5000,
-      'See all plans 已点击，但等待 5 秒仍未显示 Pro',
-    );
-    onStep('See all plans 已点击，完整套餐列表已加载');
+    const cardWaitMilliseconds = selection.amount ? PRO_CARD_WAIT_MILLISECONDS : 5000;
+    // 新版可能直接显示三档 Pro 或进入配置页的 Pro 卡片；已识别入口就跳过 See all plans。
+    if (!selection.amount || !await readProCard(page, selection.amount)) {
+      onStep('向下滚动到套餐页面底部，寻找 See all plans');
+      onStep('点击 See all plans');
+      await clickAndConfirm(
+        page,
+        'See all plans',
+        {
+          alternateTexts: ['See all'],
+          timeoutMilliseconds: 20000,
+          timeoutMessage: '滚动套餐页面后仍没有找到可见的 See all plans',
+          stabilityMilliseconds: 800,
+          scrollIntoView: true,
+        },
+        () => readAllPlansState(page, selection.amount),
+        cardWaitMilliseconds,
+        `See all plans 已点击，但等待 ${cardWaitMilliseconds / 1000} 秒仍未显示完整 Pro 卡片`,
+      );
+      onStep('See all plans 已点击，完整套餐列表已加载');
+    }
 
-    onStep('等待并识别 Pro（最多 5 秒）');
+    onStep('等待并识别 Pro，与整行任务共享剩余时间');
     if (product !== 'Pro') throw new Error(`当前流程不支持产品：${product}`);
-    onStep('Pro 已识别，点击 Upgrade to Pro');
-    await clickProCard(page, onPlans);
-    onStep('Upgrade to Pro 已点击，正在进入购买页面');
+    let selectionStage;
+    if (selection.amount) {
+      onStep(`识别 Pro ${selection.label} 的选档位置`);
+      selectionStage = await selectProAmount(page, selection.amount);
+      if (selectionStage === 'checkout') onStep(`Pro 卡片没有规格按钮，先进入配置页再选择 ${selection.label}`);
+    }
+    onStep('Pro 已识别，点击同一卡片内的购买按钮');
+    const buyAction = await clickProCard(page, onPlans, selection.amount);
+    onStep(`${buyAction} 已点击，正在进入购买页面`);
 
     onStep('等待 ChatGPT Pro 支付页');
-    await waitForCheckout(page);
-
-    onStep(`选择 ${multiplier} 套餐并等待价格更新`);
-    await selectMultiplier(page, multiplier);
+    if (selection.amount) {
+      const configureAtCheckout = selectionStage === 'checkout';
+      if (configureAtCheckout) {
+        onStep(`等待 Pro 配置页，选择 ${selection.label} 并核对单选状态`);
+        await selectProCheckoutAmount(page, selection.amount);
+      }
+      // 两条路径都必须核对最终 Due today；配置页选档还要重新核对选中态，不能把默认价当成目标规格。
+      await waitForValue(
+        async () => ({...await evaluate(page, `(${inspectProCheckout.toString()})(${JSON.stringify(selection.amount)})`),
+          selectionConfirmed: !configureAtCheckout || Boolean((await readProCheckoutOptions(page, selection.amount))?.selected)}),
+        (state) => state?.checkout && state.pro && state.amountMatches && state.selectionConfirmed,
+        CHECKOUT_WAIT_MILLISECONDS,
+        `Pro 结账页未就绪或 Due today 不等于 $${selection.amount}.00，已停止支付流程`,
+      );
+      onStep(`Pro ${selection.label} 已确认，Due today 为 $${selection.amount}.00`);
+    } else {
+      await waitForCheckout(page);
+      onStep(`选择 ${selection.multiplier} 套餐并等待价格更新`);
+      await selectMultiplier(page, selection.multiplier);
+    }
 
     onStep('确认 Card 并用键盘输入当前行银行卡');
     await fillStripeCard(profile.debugPort, row, onStep);
@@ -1702,12 +1989,91 @@ async function openChatGptAndPreparePayment(profile, row, product, multiplier, o
     }
 
     onStep('账单地址已填写，点击 Subscribe');
-    await clickSubscribeAndAwaitResult(page, profile.debugPort, onStep);
-    onStep('Subscribe 已提交，未出现拒付');
-    return captureAccountBillingProof(page, { ...proofContext, debugPort: profile.debugPort }, onStep);
+    await clickSubscribeAndAwaitResult(page, profile.debugPort, onStep, proofContext);
+    // 仅明确支付成功后才进入附加任务，点击/处理中/拒付都不能当作成功。
+    proofContext.onPaymentConfirmed();
+    onStep('支付成功，开始处理已勾选的附加选项');
+    return await runPostPurchaseActions(page, profile, row, proofContext, onStep, onStatus);
   } finally {
     page.close();
   }
+}
+
+// 购买与独立补做共用附加动作；此函数不包含套餐、卡资料或支付提交逻辑。
+async function runPostPurchaseActions(page, profile, row, proofContext, onStep, onStatus) {
+  return await completePostPurchase(proofContext.additionalOptions,
+      () => captureAccountBillingProof(page, { ...proofContext, debugPort: profile.debugPort }, onStep), onStep, {
+        exportCpa: onProgress => exportCodexCredential(createCodexDriver({
+          manager:page, debugPort:profile.debugPort, isActive:proofContext.isActive, onStep, onVerification:onStatus,
+          connectCdp, getTargets, evaluate, mouseClick, clearFocusedField, typeWithKeyboard, dispatchKey, sleep,
+        }), row, onProgress),
+        setupTwoFactor: onProgress => configureAccountTwoFactor(page, { ...proofContext, debugPort: profile.debugPort }, onStep, onProgress),
+        onProgress: proofContext.onPostPurchaseProgress,
+      });
+}
+
+export async function runAdditionalJob({jobId, row, option, apiBase, apiKey, onEvent = () => {}, registerRowControl = () => {}}) {
+  if (!['screenshot', 'cpa', '2fa'].includes(option)) throw new Error('请选择一个附加功能');
+  const serialNumber = String(row?.adsPowerSerialNumber || '').trim();
+  if (!serialNumber || (option === 'cpa' && !row.email)) throw new Error('附加任务账号资料不完整');
+  const index = row.__uiIndex;
+  if (!Number.isInteger(index) || index < 0 || index >= 100) throw new Error('任务行号无效');
+  const prefix = `第 ${index + 1} 条 / AdsPower ${serialNumber}`;
+  let active = true;
+  const deadline = Date.now() + ROW_TIMEOUT_MILLISECONDS;
+  const controller = new AbortController();
+  let page;
+  let interruptionError;
+  let currentStep = '启动 AdsPower';
+  let result = initialPostPurchaseResult([option]);
+  const fields = option === 'screenshot' ? ['screenshotUrl', 'screenshotError', 'screenshotStatus']
+    : option === 'cpa' ? ['cpaJson', 'cpaError', 'cpaStatus'] : ['twoFactorKey', 'twoFactorError', 'twoFactorStatus'];
+  // 只发布当前附加项，避免空默认值覆盖另外两项的成功结果。
+  const selected = () => Object.fromEntries(fields.map(key => [key, result[key]]));
+  const emit = payload => { if (active) onEvent({index, option, ...payload}); };
+  const stop = () => stopAdsPowerProfile({serialNumber, apiBase, apiKey}).catch(() => {});
+  const step = message => { currentStep = message; emit({type:'step_started', message:`${prefix}：${message}`}); };
+  const interruption = createRowInterruption({index, deadline, controller, registerRowControl, onInterrupt:error => {
+    interruptionError = error;
+    if (error.code === 'ROW_STOPPED') emit({type:'row_stop_requested', message:`${prefix}：正在终止本行`});
+    active = false;
+  }});
+  emit({type:'additional_started', ...selected(), message:`${prefix}：单独执行 ${option}`});
+  const work = runWithTaskBudget(async () => {
+    assertTaskActive();
+    const profile = await startAdsPowerProfile({serialNumber, apiBase, apiKey, signal:controller.signal});
+    if (!active) { await stop(); throw new Error(ROW_TIMEOUT_MESSAGE); }
+    page = await connectChatGptPage(profile.debugPort, {preferHome:true});
+    if (!active) { page.close(); throw new Error(ROW_TIMEOUT_MESSAGE); }
+    await page.command('Page.enable');
+    await page.command('Runtime.enable');
+    return runPostPurchaseActions(page, profile, row, {
+      jobId, index, additionalOptions:[option], isActive:() => active && Date.now() < deadline,
+      onPostPurchaseProgress: patch => {
+        if (!active) return;
+        result = {...result, ...patch};
+        emit({type:'additional_progress', ...selected(), message:`${prefix}：${option} 结果已更新`});
+      },
+    }, step, message => emit({type:'login_verification_required', message:`${prefix}：${message}`}));
+  }, () => active, deadline, controller.signal);
+  try {
+    result = await Promise.race([work, interruption.wait]);
+  } catch {
+    const reason = interruptionError?.message || '浏览器未就绪或连接中断，请单独重试';
+    result = interruptedPostPurchaseResult(result, reason);
+    const resultPrefix = option === '2fa' ? 'twoFactor' : option;
+    result[`${resultPrefix}Error`] = `${currentStep}未完成：${reason}`;
+  } finally {
+    interruption.finish();
+    active = false;
+    controller.abort();
+    page?.close();
+    await stop();
+  }
+  const proof = selected();
+  onEvent({type:'additional_finished', index, option, ...proof,
+    message:`${prefix}：${option} ${fields.some(key => key.endsWith('Error') && proof[key]) ? '未完成，请查看附加结果' : '已完成'}；保留付款成功状态`});
+  return [{index, ...proof}];
 }
 
 async function runWithConcurrency(rows, concurrency, worker, shouldStop = () => false) {
@@ -1740,8 +2106,9 @@ async function runWithConcurrency(rows, concurrency, worker, shouldStop = () => 
 }
 
 function validatePaymentRow(row, rechargeType) {
-  const requiredFields = ['adsPowerSerialNumber', 'email', 'password', 'cardNumber', 'expires_at', 'cvv'];
-  if (rechargeType === 'google-incognito') requiredFields.splice(0, 1);
+  const requiredFields = rechargeType === 'google-incognito'
+    ? ['email', 'password', 'cardNumber', 'expires_at', 'cvv']
+    : ['adsPowerSerialNumber', 'email', 'cardNumber', 'expires_at', 'cvv'];
   const missingFields = requiredFields.filter((field) => !String(row[field] || '').trim());
   if (missingFields.length) throw new Error(`当前任务缺少字段：${missingFields.join('、')}`);
   if (rechargeType === 'google-incognito' && !String(row.mailAccess || '').trim()) throw new Error('当前任务缺少 mailAccess');
@@ -1755,15 +2122,19 @@ export async function runUpgradeJob({
   rows,
   concurrency = 1,
   product = 'Pro',
-  multiplier = '20x',
+  multiplier,
+  planAmount,
+  additionalOptions,
   rechargeType = 'ads',
   apiBase,
   apiKey,
   onEvent = () => {},
   shouldStop = () => false,
+  registerRowControl = () => {},
 }) {
   if (!PRODUCTS.includes(product)) throw new Error(`不支持的 GPT 产品：${product}`);
-  if (!MULTIPLIERS.includes(multiplier)) throw new Error(`不支持的倍率：${multiplier}`);
+  const selection = resolveProSelection({ rechargeType, planAmount, multiplier });
+  const selectedOptions = resolveAdditionalOptions(additionalOptions, rechargeType);
   if (!['ads', 'google-incognito'].includes(rechargeType)) throw new Error(`不支持的充值类型：${rechargeType}`);
 
   const boundedConcurrency = Math.max(1, Math.min(10, Number(concurrency) || 1));
@@ -1774,7 +2145,12 @@ export async function runUpgradeJob({
     let profile;
     let currentStep = '任务校验';
     let active = true;
-    let timeoutId;
+    const deadline = Date.now() + ROW_TIMEOUT_MILLISECONDS;
+    const controller = new AbortController();
+    let interruptionError;
+    let paymentSubmitted = false;
+    let paymentConfirmed = false;
+    let postPurchaseResult = initialPostPurchaseResult(selectedOptions);
     const stopBrowser = () => rechargeType === 'google-incognito'
       ? stopGoogleIncognitoBrowser(profile)
       : stopAdsPowerProfile({ serialNumber, apiBase, apiKey }).catch(() => {});
@@ -1787,77 +2163,88 @@ export async function runUpgradeJob({
       // 卡、账号和账单地址始终来自同一任务行，禁止跨行借用。
       validatePaymentRow(row, rechargeType);
       currentStep = rechargeType === 'google-incognito' ? '启动谷歌无痕浏览器' : '启动 AdsPower';
-      emit({ type: 'row_started', index: uiIndex, message: `${prefix}：${currentStep}` });
+      emit({ type: 'row_started', index: uiIndex, subscriptionType: `${product} / ${selection.label}`, additionalOptions: selectedOptions, message: `${prefix}：${currentStep}` });
+      assertTaskActive();
       profile = rechargeType === 'google-incognito'
         ? await startGoogleIncognitoBrowser()
-        : await startAdsPowerProfile({ serialNumber, apiBase, apiKey });
-      if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
+        : await startAdsPowerProfile({ serialNumber, apiBase, apiKey, signal:controller.signal });
+      if (!active) { await stopBrowser(); throw new Error(ROW_TIMEOUT_MESSAGE); }
       emit({ type: 'browser_started', index: uiIndex, message: `${prefix}：已打开${rechargeType === 'google-incognito' ? '谷歌无痕浏览器' : 'AdsPower'}，进入 chatgpt.com` });
 
-      const proof = await openChatGptAndPreparePayment(profile, row, product, multiplier, (message) => {
+      const proof = await openChatGptAndPreparePayment(profile, row, product, selection, (message) => {
         emit({ type: 'login_verification_required', index: uiIndex, message: `${prefix}：${message}` });
       }, (plans) => emit({ type: 'plans_discovered', index: uiIndex, plans }), (step) => {
         if (!active) return;
         currentStep = step;
         emit({ type: 'step_started', index: uiIndex, message: `${prefix}：${step}` });
-      }, { jobId, index: uiIndex, rechargeType });
+      }, { jobId, index: uiIndex, rechargeType, additionalOptions: selectedOptions,
+        isActive: () => active && Date.now() < deadline,
+        onPaymentSubmitted: () => { if (active) paymentSubmitted = true; },
+        onPaymentConfirmed: () => {
+          if (!active) return;
+          paymentConfirmed = true;
+          emit({type:'row_payment_confirmed', index:uiIndex, serialNumber, subscriptionType:`${product} / ${selection.label}`,
+            message:`${prefix}：已确认支付成功`});
+        },
+        onPostPurchaseProgress: progress => {
+          if (!active) return;
+          postPurchaseResult = { ...postPurchaseResult, ...progress };
+          emit({ type: 'post_purchase_progress', index: uiIndex, ...postPurchaseResult, message: `${prefix}：附加任务结果已更新${progress.cpaError ? `；${progress.cpaError}` : ''}` });
+        },
+      });
       if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
       return proof || {};
     };
 
-    // 从本条任务开始执行起计 3 分钟；Subscribe 提交后页面可能长时间转圈，超时立刻关浏览器并释放并发空位。
-    const timeout = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        active = false;
-        stopBrowser();
-        reject(new Error(ROW_TIMEOUT_MESSAGE));
-      }, ROW_TIMEOUT_MILLISECONDS);
-    });
-    const work = runRow();
+    const interruption = createRowInterruption({index:uiIndex, deadline, controller, registerRowControl, onInterrupt:error => {
+      interruptionError = error;
+      if (error.code === 'ROW_STOPPED') emit({type:'row_stop_requested', index:uiIndex, message:`${prefix}：正在终止本行`});
+      active = false;
+    }});
+    const work = runWithTaskBudget(runRow, () => active, deadline, controller.signal);
     work.catch(() => {});
     try {
-      const proof = await Promise.race([work, timeout]);
-      clearTimeout(timeoutId);
+      const proof = await Promise.race([work, interruption.wait]);
+      interruption.finish();
       if (!active) throw new Error(ROW_TIMEOUT_MESSAGE);
-      if (!proof?.screenshotUrl) throw new Error(proof?.screenshotError || 'Billing 截图未完成');
-      // 截图完成后再把任务标为已完成，然后才关闭当前 Profile。
+      if (!paymentConfirmed) throw new Error('尚未确认支付成功');
+      active = false;
+      controller.abort();
+      await stopBrowser();
+      // 支付与附加结果分别保存；附加项失败也不能重跑已付款任务。
       onEvent({
         type: 'row_succeeded',
         index: uiIndex,
-        screenshotUrl: proof.screenshotUrl,
-        screenshotError: '',
-        message: `${prefix}：${product} / ${multiplier} 已点击 Subscribe，Billing 截图已保存`,
+        ...proof,
+        message: `${prefix}：${product} / ${selection.label} 支付成功；${proof.screenshotError || proof.cpaError || proof.twoFactorError ? '附加任务有未完成项，请查看任务结果' : '已完成所选附加任务'}`,
       });
-      await stopBrowser();
-      return { index: uiIndex, serialNumber, status: 'succeeded', screenshotUrl: proof.screenshotUrl };
+      return { index: uiIndex, serialNumber, status: 'succeeded', ...proof };
     } catch (error) {
-      clearTimeout(timeoutId);
-      const timedOut = !active || String(error.message || '').includes(ROW_TIMEOUT_MESSAGE);
-      const afterPayment = /Subscribe 已提交|第一次点击|补点|支付处理中|支付成功|充值完成|左下角头像|点击 Settings|点击 Billing|Billing 已打开|Billing 截图/.test(currentStep);
-      if (afterPayment) {
-        // Subscribe 已经成功；截图阶段超时或失败不能打进失败重试，避免重复扣款。
-        const screenshotError = timedOut ? ROW_TIMEOUT_MESSAGE : error.message;
-        active = false;
-        onEvent({
-          type: 'row_succeeded',
-          index: uiIndex,
-          screenshotUrl: '',
-          screenshotError,
-          message: `${prefix}：${product} / ${multiplier} 已点击 Subscribe，未出现拒付；Billing 截图未完成：${screenshotError}`,
-        });
-        await stopBrowser();
-        return { index: uiIndex, serialNumber, status: 'succeeded', screenshotError };
-      }
-      const reason = timedOut
-        ? `${currentStep}失败：${ROW_TIMEOUT_MESSAGE}`
-        : `${currentStep}失败：${error.message}`;
+      interruption.finish();
+      const stopped = interruptionError?.code === 'ROW_STOPPED';
+      const cause = interruptionError?.message || error.message;
       active = false;
+      controller.abort();
       await stopBrowser();
-      onEvent({ type: 'row_failed', index: uiIndex, message: `${prefix}：${reason}；已终止该条任务并关闭浏览器` });
-      return { index: uiIndex, serialNumber, status: 'failed', error: reason };
+      if (paymentConfirmed) {
+        // 已付款时只结束附加项，截图、CPA 和已读取的 Key 原样保留，禁止进入充值重试。
+        const proof = interruptedPostPurchaseResult(postPurchaseResult, stopped ? ROW_STOP_MESSAGE : undefined);
+        onEvent({ type: 'row_succeeded', index: uiIndex, ...proof,
+          message: `${prefix}：${product} / ${selection.label} 支付成功；${stopped ? '用户终止剩余附加任务' : '附加任务中断'}，请查看任务结果`,
+        });
+        return { index: uiIndex, serialNumber, status: 'succeeded', ...proof };
+      }
+      const paymentReviewRequired = stopped && paymentSubmitted;
+      const reason = `${currentStep}${stopped ? '已终止' : '失败'}：${cause}${paymentReviewRequired ? '；付款已提交但结果未确认，请先核对账单，禁止直接重复充值' : ''}`;
+      // 排队取消和主动终止都不计入批量失败重试；支付已提交时单独保留待核实记录。
+      onEvent({ type: stopped ? 'row_cancelled' : 'row_failed', index: uiIndex, serialNumber,
+        paymentReviewRequired, subscriptionType:`${product} / ${selection.label}`,
+        message: `${prefix}：${reason}；已结束本行并请求关闭浏览器` });
+      return { index: uiIndex, serialNumber, status: paymentReviewRequired ? 'payment_review' : stopped ? 'cancelled' : 'failed', error: reason };
     } finally {
-      clearTimeout(timeoutId);
-      if (row.stopProfile) await stopBrowser();
+      interruption.finish();
+      active = false;
+      controller.abort();
     }
   }, shouldStop);
 
